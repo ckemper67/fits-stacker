@@ -28,6 +28,20 @@ ifeq ($(PNG_LIBS),)
     PNG_LIBS = -lpng
 endif
 
+# Optional OpenCV backend for warp and debayer: make OPENCV=1
+OPENCV ?= 0
+ifeq ($(OPENCV),1)
+    OPENCV_CFLAGS := $(shell pkg-config --cflags opencv4 2>/dev/null || \
+                              pkg-config --cflags opencv  2>/dev/null)
+    OPENCV_LIBS   := $(shell pkg-config --libs   opencv4 2>/dev/null || \
+                              pkg-config --libs   opencv  2>/dev/null)
+    ifeq ($(OPENCV_LIBS),)
+        $(error OpenCV not found via pkg-config. Install opencv4 or set OPENCV_CFLAGS/OPENCV_LIBS manually.)
+    endif
+    CXXFLAGS += -DHAVE_OPENCV $(OPENCV_CFLAGS)
+    LDFLAGS  += $(OPENCV_LIBS)
+endif
+
 SRCS = fits_stack.cpp donuts/donuts.cpp
 BIN  = fits_stack
 

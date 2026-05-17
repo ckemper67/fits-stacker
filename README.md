@@ -22,15 +22,28 @@ optional PNG with asinh stretch for quick preview.
 
     sudo apt install libcfitsio-dev libpng-dev
 
+### Optional: OpenCV (better debayer and warp)
+
+    brew install opencv          # macOS
+    sudo apt install libopencv-dev   # Debian/Ubuntu
+
 ## Build
 
-    make
+    make               # native NEON/SSE2 warp, 2x2 average debayer
+    make OPENCV=1      # OpenCV bilinear warp and debayer (better quality)
 
-Or manually:
+Or manually (native):
 
     c++ -std=c++17 -O2 -march=native -I donuts \
         fits_stack.cpp donuts/donuts.cpp \
         -lcfitsio -lpng \
+        -o fits_stack
+
+With OpenCV:
+
+    c++ -std=c++17 -O2 -march=native -I donuts -DHAVE_OPENCV \
+        fits_stack.cpp donuts/donuts.cpp \
+        -lcfitsio -lpng $(pkg-config --cflags --libs opencv4) \
         -o fits_stack
 
 ## Usage
@@ -84,9 +97,11 @@ reference and is always included in the stack.
 - Frame-level rejection: hard bounds on rotation (5 deg) and translation
   (150 px half-res), followed by MAD sigma-clip on the measured transforms.
 - Bicubic (Catmull-Rom) resampling with a NEON/SSE2 fast path for interior
-  pixels.
+  pixels. When built with `OPENCV=1`, uses `cv::warpAffine(INTER_CUBIC)` instead.
 - Colour frames are Bayer-demosaiced at half resolution for alignment;
   all four Bayer patterns (RGGB, GRBG, GBRG, BGGR) are supported.
+  With `OPENCV=1`, uses `cv::cvtColor` bilinear demosaic + INTER_AREA
+  downsample instead of simple 2x2 cell averaging.
 
 ## Source layout
 

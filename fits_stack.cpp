@@ -73,6 +73,11 @@
 #include <thread>
 #include <vector>
 
+#ifdef HAVE_OPENCV
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#endif
+
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 // Horizontal sum of 4 floats.
@@ -345,14 +350,64 @@ static vector<Pix> extractGreen(const vector<Pix> &bayer, int bw, int bh,
     return green;
 }
 
+// pat is the BAYERPAT string (e.g. "RGGB"); used only by the OpenCV path.
 static void debayer(const vector<Pix> &bayer, int bw, int bh,
                     vector<Pix> &r, vector<Pix> &g, vector<Pix> &b,
-                    int &w, int &h, const BayerLayout &bl)
+                    int &w, int &h, const BayerLayout &bl, const string &pat = "")
 {
     w = bw / 2;
     h = bh / 2;
     size_t npix = (size_t)w * h;
     r.resize(npix); g.resize(npix); b.resize(npix);
+
+#ifdef HAVE_OPENCV
+    // OpenCV Bayer->BGR bilinear demosaic at full resolution, then INTER_AREA
+    // downsample to half resolution. Gives better edge quality than 2x2 average.
+    // Requires data in [0, 65535]; scales from actual min/max and back.
+    // Pattern mapping: XY in COLOR_BayerXY2BGR means top-left=X, top-right=Y.
+    int cvCode = -1;
+    if      (pat == "RGGB") cvCode = cv::COLOR_BayerRG2BGR;
+    else if (pat == "GRBG") cvCode = cv::COLOR_BayerGR2BGR;
+    else if (pat == "GBRG") cvCode = cv::COLOR_BayerGB2BGR;
+    else if (pat == "BGGR") cvCode = cv::COLOR_BayerBG2BGR;
+
+    if (cvCode >= 0)
+    {
+        cv::Mat src(bh, bw, CV_32F, const_cast<Pix *>(bayer.data()));
+        double minVal, maxVal;
+        cv::minMaxIdx(src, &minVal, &maxVal);
+        if (maxVal <= minVal) maxVal = minVal + 1.0;
+
+        // Scale to uint16 for cvtColor, which doesn't support float Bayer.
+        cv::Mat src16;
+        src.convertTo(src16, CV_16U, 65535.0 / (maxVal - minVal),
+                      -minVal * 65535.0 / (maxVal - minVal));
+
+        cv::Mat bgr16;
+        cv::cvtColor(src16, bgr16, cvCode);
+
+        // Downsample to half resolution with INTER_AREA (correct averaging).
+        cv::Mat bgr16half;
+        cv::resize(bgr16, bgr16half, cv::Size(w, h), 0, 0, cv::INTER_AREA);
+
+        // Split BGR channels and scale back to original float range.
+        vector<cv::Mat> chans(3);
+        cv::split(bgr16half, chans);  // chans[0]=B, [1]=G, [2]=R
+        double invScale = (maxVal - minVal) / 65535.0;
+        for (int chan = 0; chan < 3; ++chan)
+            chans[chan].convertTo(chans[chan], CV_32F, invScale, minVal);
+
+        // Copy from cv::Mat to our float vectors.
+        std::copy((Pix*)chans[2].datastart, (Pix*)chans[2].dataend, r.begin());
+        std::copy((Pix*)chans[1].datastart, (Pix*)chans[1].dataend, g.begin());
+        std::copy((Pix*)chans[0].datastart, (Pix*)chans[0].dataend, b.begin());
+        return;
+    }
+#else
+    (void)pat;
+#endif
+
+    // Fallback: 2x2 cell average (fast, half-resolution).
     const int rr = bl.r  >> 1, rc  = bl.r  & 1;
     const int g1r= bl.g1 >> 1, g1c = bl.g1 & 1;
     const int g2r= bl.g2 >> 1, g2c = bl.g2 & 1;
@@ -552,6 +607,53 @@ static void alignFrame3rows(
         // Right border.
         for (int x = xInHi + 1; x < w; ++x) slowPixel(x);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Warp dispatcher: OpenCV warpAffine or our NEON/SSE2 bicubic.
+// Same signature; chosen at compile time via HAVE_OPENCV.
+// ---------------------------------------------------------------------------
+
+static void alignFrame3(
+    const vector<Pix> &srcR, const vector<Pix> &srcG, const vector<Pix> &srcB,
+    int w, int h,
+    const Donuts::AffineMatrix &m,
+    vector<Pix> &dstR, vector<Pix> &dstG, vector<Pix> &dstB,
+    vector<uint8_t> &mask,
+    int nThreads)
+{
+#ifdef HAVE_OPENCV
+    // m maps destination pixel -> source pixel (inverse warp convention).
+    // cv::warpAffine with WARP_INVERSE_MAP interprets M the same way.
+    cv::Mat M_cv = (cv::Mat_<double>(2, 3) << m.a, m.b, m.tx, m.c, m.d, m.ty);
+    cv::Size sz(w, h);
+    const int flags = cv::INTER_CUBIC | cv::WARP_INVERSE_MAP;
+
+    cv::Mat cvR(h, w, CV_32F, const_cast<Pix *>(srcR.data()));
+    cv::Mat cvG(h, w, CV_32F, const_cast<Pix *>(srcG.data()));
+    cv::Mat cvB(h, w, CV_32F, const_cast<Pix *>(srcB.data()));
+    cv::Mat outR(h, w, CV_32F, dstR.data());
+    cv::Mat outG(h, w, CV_32F, dstG.data());
+    cv::Mat outB(h, w, CV_32F, dstB.data());
+
+    cv::warpAffine(cvR, outR, M_cv, sz, flags, cv::BORDER_CONSTANT, 0);
+    cv::warpAffine(cvG, outG, M_cv, sz, flags, cv::BORDER_CONSTANT, 0);
+    cv::warpAffine(cvB, outB, M_cv, sz, flags, cv::BORDER_CONSTANT, 0);
+
+    // Build mask: warp a ones image with nearest-neighbour to get a clean binary boundary.
+    cv::Mat ones = cv::Mat::ones(h, w, CV_32F);
+    cv::Mat warpedOnes;
+    cv::warpAffine(ones, warpedOnes, M_cv, sz,
+                   cv::INTER_NEAREST | cv::WARP_INVERSE_MAP, cv::BORDER_CONSTANT, 0);
+    const float *mp = warpedOnes.ptr<float>();
+    for (int k = 0; k < w * h; ++k) mask[k] = mp[k] > 0.5f ? 1 : 0;
+#else
+    (void)nThreads;  // used by parallelFor inside
+    parallelFor(h, nThreads, [&](int ylo, int yhi)
+    {
+        alignFrame3rows(srcR, srcG, srcB, w, h, m, dstR, dstG, dstB, mask, ylo, yhi);
+    });
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +953,11 @@ int main(int argc, char **argv)
         cout << " kappa=" << kappa;
     if (mode == StackMode::WelfordStream && wUpN > 0)
         cout << " warmup=" << wUpN;
+#ifdef HAVE_OPENCV
+    cout << "  warp=opencv debayer=opencv";
+#else
+    cout << "  warp=native debayer=native";
+#endif
     cout << "  threads=" << nThreads << "\n";
 
     Donuts::Guider guider;
@@ -1136,7 +1243,7 @@ int main(int argc, char **argv)
 
     {
         vector<Pix> r, g, b;
-        if (bayer) { int tw=0,th=0; debayer(refRaw, bw, bh, r, g, b, tw, th, refLayout); }
+        if (bayer) { int tw=0,th=0; debayer(refRaw, bw, bh, r, g, b, tw, th, refLayout, refPat); }
         else       { r = refRaw; g = refRaw; b = refRaw; }
         if      (warmPhase)                        addToWarmBuffer(r, g, b, nullptr);
         else if (mode == StackMode::WelfordStream) welfordFrame(r, g, b, nullptr, true);
@@ -1156,18 +1263,14 @@ int main(int argc, char **argv)
         if (raw.empty()) continue;
 
         vector<Pix> r, g, b;
-        if (bayer) { int tw=0,th=0; debayer(raw, fw, fh, r, g, b, tw, th, refLayout); }
+        if (bayer) { int tw=0,th=0; debayer(raw, fw, fh, r, g, b, tw, th, refLayout, refPat); }
         else       { r = raw; g = raw; b = raw; }
 
         vector<Pix>     dstR(npix), dstG(npix), dstB(npix);
         vector<uint8_t> mask(npix, 0);
 
         const auto M = fi.t.alignmentMatrix(dw, dh);
-        parallelFor(dh, nThreads, [&](int ylo, int yhi)
-        {
-            alignFrame3rows(r, g, b, dw, dh, M,
-                            dstR, dstG, dstB, mask, ylo, yhi);
-        });
+        alignFrame3(r, g, b, dw, dh, M, dstR, dstG, dstB, mask, nThreads);
 
         if (warmPhase)
         {
