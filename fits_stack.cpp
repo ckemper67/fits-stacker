@@ -1578,16 +1578,12 @@ int main(int argc, char **argv)
     }
 
     vector<string> outputPaths;
-    StackMode mode     = StackMode::Mean;
+    StackMode mode     = StackMode::WelfordStream;
     double    kappa    = 3.0;
     int       nThreads = (int)thread::hardware_concurrency();
     if (nThreads < 1) nThreads = 1;
     int       wUpN     = 5;   // warm-up frame count for wstream (-w N); 0 = disabled
-#ifdef HAVE_OPENCV
-    Backend   backend  = Backend::OpenCV;
-#else
     Backend   backend  = Backend::Native;
-#endif
 
     vector<string> inputs;
 
