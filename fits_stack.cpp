@@ -419,6 +419,63 @@ static void debayerOpenCV(const vector<Pix> &bayer, int bw, int bh,
     std::copy((Pix*)chans[0].datastart, (Pix*)chans[0].dataend, b.begin());
     (void)bl;
 }
+
+// Reassemble stacked subplanes into a full-res Bayer mosaic, apply OpenCV
+// bilinear demosaic, then INTER_AREA downsample back to half resolution.
+static void debayerOpenCVPostStack(
+    const vector<Pix> &R, const vector<Pix> &G1,
+    const vector<Pix> &G2, const vector<Pix> &B,
+    int w, int h, const BayerLayout &bl, const string &pat,
+    vector<Pix> &outR, vector<Pix> &outG, vector<Pix> &outB)
+{
+    size_t npix = (size_t)w * h;
+    outR.resize(npix); outG.resize(npix); outB.resize(npix);
+
+    int cvCode = -1;
+    if      (pat == "RGGB") cvCode = cv::COLOR_BayerRG2BGR;
+    else if (pat == "GRBG") cvCode = cv::COLOR_BayerGR2BGR;
+    else if (pat == "GBRG") cvCode = cv::COLOR_BayerGB2BGR;
+    else if (pat == "BGGR") cvCode = cv::COLOR_BayerBG2BGR;
+    if (cvCode < 0) return;
+
+    // Assemble full-res Bayer from stacked half-res subplanes.
+    const int bw = w * 2, bh = h * 2;
+    vector<Pix> bayer((size_t)bw * bh);
+    const int rr  = bl.r  >> 1, rc  = bl.r  & 1;
+    const int g1r = bl.g1 >> 1, g1c = bl.g1 & 1;
+    const int g2r = bl.g2 >> 1, g2c = bl.g2 & 1;
+    const int br  = bl.b  >> 1, bc  = bl.b  & 1;
+    for (int row = 0; row < h; ++row)
+        for (int col = 0; col < w; ++col)
+        {
+            size_t i = (size_t)row * w + col;
+            bayer[(size_t)(2*row + rr ) * bw + (2*col + rc )] = R [i];
+            bayer[(size_t)(2*row + g1r) * bw + (2*col + g1c)] = G1[i];
+            bayer[(size_t)(2*row + g2r) * bw + (2*col + g2c)] = G2[i];
+            bayer[(size_t)(2*row + br ) * bw + (2*col + bc )] = B [i];
+        }
+
+    // Normalize to uint16 for cvtColor, demosaic, INTER_AREA downsample.
+    cv::Mat src(bh, bw, CV_32F, bayer.data());
+    double minVal, maxVal;
+    cv::minMaxIdx(src, &minVal, &maxVal);
+    if (maxVal <= minVal) maxVal = minVal + 1.0;
+    cv::Mat src16;
+    src.convertTo(src16, CV_16U, 65535.0 / (maxVal - minVal),
+                  -minVal * 65535.0 / (maxVal - minVal));
+    cv::Mat bgr16;
+    cv::cvtColor(src16, bgr16, cvCode);
+    cv::Mat bgr16half;
+    cv::resize(bgr16, bgr16half, cv::Size(w, h), 0, 0, cv::INTER_AREA);
+    vector<cv::Mat> chans(3);
+    cv::split(bgr16half, chans);   // chans[0]=B [1]=G [2]=R
+    double invScale = (maxVal - minVal) / 65535.0;
+    for (int c = 0; c < 3; ++c)
+        chans[c].convertTo(chans[c], CV_32F, invScale, minVal);
+    std::copy((Pix*)chans[2].datastart, (Pix*)chans[2].dataend, outR.begin());
+    std::copy((Pix*)chans[1].datastart, (Pix*)chans[1].dataend, outG.begin());
+    std::copy((Pix*)chans[0].datastart, (Pix*)chans[0].dataend, outB.begin());
+}
 #endif // HAVE_OPENCV
 
 // ---------------------------------------------------------------------------
@@ -1630,7 +1687,7 @@ int main(int argc, char **argv)
         return std::chrono::duration_cast<Sec>(Clock::now() - t0).count();
     };
 
-    double t_io = 0, t_subplane = 0, t_warp = 0, t_stack = 0, t_mhc = 0;
+    double t_io = 0, t_subplane = 0, t_warp = 0, t_stack = 0, t_debayer = 0;
     Clock::time_point t0;
 
     // ------------------------------------------------------------------
@@ -1643,14 +1700,6 @@ int main(int argc, char **argv)
         {
             t0 = Clock::now();
             int tw=0,th=0;
-#ifdef HAVE_OPENCV
-            if (backend == Backend::OpenCV)
-            {
-                debayerOpenCV(refRaw, bw, bh, r, g1, b, tw, th, refLayout, refPat);
-                g2 = g1;
-            }
-            else
-#endif
             extractSubplanes(refRaw, bw, bh, r, g1, g2, b, tw, th, refLayout);
             t_subplane += since(t0);
         }
@@ -1683,14 +1732,6 @@ int main(int argc, char **argv)
         {
             t0 = Clock::now();
             int tw=0,th=0;
-#ifdef HAVE_OPENCV
-            if (backend == Backend::OpenCV)
-            {
-                debayerOpenCV(raw, fw, fh, r, g1, b, tw, th, refLayout, refPat);
-                g2 = g1;
-            }
-            else
-#endif
             extractSubplanes(raw, fw, fh, r, g1, g2, b, tw, th, refLayout);
             t_subplane += since(t0);
         }
@@ -1753,34 +1794,31 @@ int main(int argc, char **argv)
                      mode, kappa, nThreads, finalR, finalG1, finalG2, finalB);
     }
 
-    // Post-stack debayer: MHC for native backend; opencv used its own per-frame.
+    // Post-stack debayer: opencv bilinear for opencv backend, MHC for native.
     vector<Pix> finalRout(npix), finalG(npix), finalBout(npix);
+    t0 = Clock::now();
 #ifdef HAVE_OPENCV
     if (backend == Backend::OpenCV)
-    {
-        finalRout = finalR; finalG = finalG1; finalBout = finalB;
-    }
+        debayerOpenCVPostStack(finalR, finalG1, finalG2, finalB, dw, dh,
+                               refLayout, refPat, finalRout, finalG, finalBout);
     else
 #endif
-    {
-        t0 = Clock::now();
         debayerMHC_halfres(finalR, finalG1, finalG2, finalB, dw, dh,
                            finalRout, finalG, finalBout, nThreads);
-        t_mhc = since(t0);
-    }
+    t_debayer = since(t0);
 
     // ------------------------------------------------------------------
     // Print timing breakdown.
     // ------------------------------------------------------------------
 
     {
-        double total = t_io + t_subplane + t_warp + t_stack + t_mhc;
+        double total = t_io + t_subplane + t_warp + t_stack + t_debayer;
         auto pct = [&](double t) { return total > 0 ? (int)(100.0 * t / total + 0.5) : 0; };
         cout << "Timings (s):  io="       << t_io
              << "  subplane=" << t_subplane << " (" << pct(t_subplane) << "%)"
              << "  warp="     << t_warp     << " (" << pct(t_warp)     << "%)"
              << "  stack="    << t_stack    << " (" << pct(t_stack)    << "%)"
-             << "  mhc="      << t_mhc      << " (" << pct(t_mhc)      << "%)"
+             << "  debayer="   << t_debayer      << " (" << pct(t_debayer)      << "%)"
              << "  total="    << total      << "\n";
     }
 
