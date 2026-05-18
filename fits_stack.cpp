@@ -43,9 +43,12 @@
  *       -o Tests/ekos/guide/fits_stack
  *
  * Usage:
- *   ./fits_stack [-o output.fits] [-p output.png]
+ *   ./fits_stack [-o output.fits] [-o preview.png]
  *               [-m mean|median|sigmaclip|wstream] [-k kappa] [-j threads]
  *               [-w N] frame1.fits frame2.fits ...
+ *
+ *   -o may be given multiple times; extension selects format:
+ *      .fits / .fit -> FITS,  .png -> PNG.  Default: stacked.fits
  *
  *   -w N  Warm-up buffer for wstream mode: collect the first N accepted frames
  *         into a sigmaclip buffer, then seed the Welford {mean, M2} state from
@@ -1566,14 +1569,15 @@ int main(int argc, char **argv)
     if (argc < 2)
     {
         cerr << "Usage: " << argv[0]
-             << " [-o output.fits] [-p output.png]"
+             << " [-o output.fits] [-o preview.png]"
                 " [-m mean|median|sigmaclip|wstream] [-k kappa] [-j threads]"
-                " [-w N] [-b native|opencv] frame1.fits ...\n";
+                " [-w N] [-b native|opencv] frame1.fits ...\n"
+                "  -o may be given multiple times; extension selects format (.fits/.fit -> FITS, .png -> PNG).\n"
+                "  Default output: stacked.fits\n";
         return 1;
     }
 
-    string    outputPath = "stacked.fits";
-    string    pngPath;
+    vector<string> outputPaths;
     StackMode mode     = StackMode::Mean;
     double    kappa    = 3.0;
     int       nThreads = (int)thread::hardware_concurrency();
@@ -1590,8 +1594,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i)
     {
         string a = argv[i];
-        if      (a == "-o" && i+1 < argc) outputPath = argv[++i];
-        else if (a == "-p" && i+1 < argc) pngPath    = argv[++i];
+        if      (a == "-o" && i+1 < argc) outputPaths.push_back(argv[++i]);
         else if (a == "-k" && i+1 < argc)
         {
             try { kappa = stod(argv[++i]); }
@@ -2040,8 +2043,7 @@ int main(int argc, char **argv)
     // Flush whatever warm frames accumulated when total accepted < wUpN.
     if (warmPhase && warmCount > 0) flushWarmBuffer();
 
-    cout << "\nStacked " << stackCount << "/" << (int)inputs.size()
-         << " frames -> " << outputPath << "\n";
+    cout << "\nStacked " << stackCount << "/" << (int)inputs.size() << " frames\n";
 
     // ------------------------------------------------------------------
     // Reduce to final image.
@@ -2103,26 +2105,45 @@ int main(int argc, char **argv)
     }
 
     // ------------------------------------------------------------------
-    // Write outputs.
+    // Write outputs -- extension selects format.
     // ------------------------------------------------------------------
 
-    if (bayer)
+    if (outputPaths.empty()) outputPaths.push_back("stacked.fits");
+
+    auto lowerExt = [](const string &p) {
+        auto pos = p.rfind('.');
+        string e = pos == string::npos ? "" : p.substr(pos + 1);
+        for (auto &c : e) c = (char)tolower((unsigned char)c);
+        return e;
+    };
+
+    for (const auto &path : outputPaths)
     {
-        if (!writeFITS3(outputPath, finalRout, finalG, finalBout, dw, dh)) return 1;
-        cout << "Output: " << dw << "x" << dh << " 3-plane FITS (R/G/B)\n";
-        if (!pngPath.empty())
+        string e = lowerExt(path);
+        if (e == "png")
         {
-            if (!writePNG(pngPath, finalRout, finalG, finalBout, dw, dh)) return 1;
-            cout << "PNG:    " << pngPath << "\n";
+            if (bayer)
+            {
+                if (!writePNG(path, finalRout, finalG, finalBout, dw, dh)) return 1;
+            }
+            else
+            {
+                if (!writePNG(path, finalRout, finalRout, finalRout, dw, dh)) return 1;
+            }
+            cout << "PNG:    " << path << "\n";
         }
-    }
-    else
-    {
-        if (!writeFITS(outputPath, finalRout, dw, dh)) return 1;
-        if (!pngPath.empty())
+        else
         {
-            if (!writePNG(pngPath, finalRout, finalRout, finalRout, dw, dh)) return 1;
-            cout << "PNG:    " << pngPath << "\n";
+            if (bayer)
+            {
+                if (!writeFITS3(path, finalRout, finalG, finalBout, dw, dh)) return 1;
+                cout << "FITS:   " << path << "  (" << dw << "x" << dh << " 3-plane R/G/B)\n";
+            }
+            else
+            {
+                if (!writeFITS(path, finalRout, dw, dh)) return 1;
+                cout << "FITS:   " << path << "\n";
+            }
         }
     }
 

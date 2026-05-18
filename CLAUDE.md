@@ -14,10 +14,13 @@ No cmake. No install step. Binary lands at `./fits_stack`.
 
 ## Run
 
-    ./fits_stack [-o out.fits] [-p out.png]
+    ./fits_stack [-o out.fits] [-o preview.png]
                  [-m mean|median|sigmaclip|wstream] [-k kappa]
                  [-j threads] [-w warmup_frames] [-b native|opencv]
                  frame1.fits frame2.fits ...
+
+-o may be repeated; extension picks format (.fits/.fit -> FITS, .png -> PNG).
+Default output: stacked.fits
 
 Inputs sorted alphabetically; first is the alignment reference.
 
