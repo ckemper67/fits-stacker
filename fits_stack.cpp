@@ -7,9 +7,9 @@
  *
  * Monochrome: aligns and stacks directly.
  * Bayer (BAYERPAT=RGGB): extracts green at half resolution for DONUTS
- * registration, then 2x2 debayers and applies the rigid-body transform to
- * each colour channel before stacking. Output is a 3-plane FITS (R/G/B) at
- * half resolution.
+ * registration, then extracts R, G1, G2, B subplanes (each at half-res),
+ * warps all 4 subplanes, stacks them, and applies Malvar-He-Cutler 2004
+ * demosaicing post-stack to produce a 3-plane FITS (R/G/B) at half resolution.
  *
  * Alignment: Catmull-Rom bicubic with clamped boundaries.
  *
@@ -357,71 +357,69 @@ static vector<Pix> extractGreen(const vector<Pix> &bayer, int bw, int bh,
     return green;
 }
 
-// pat is the BAYERPAT string (e.g. "RGGB"); used only by the OpenCV path.
-static void debayer(const vector<Pix> &bayer, int bw, int bh,
-                    vector<Pix> &r, vector<Pix> &g, vector<Pix> &b,
-                    int &w, int &h, const BayerLayout &bl, const string &pat = "",
-                    Backend backend = Backend::Native)
+static void extractSubplanes(const vector<Pix> &bayer, int bw, int bh,
+    vector<Pix> &R, vector<Pix> &G1, vector<Pix> &G2, vector<Pix> &B,
+    int &w, int &h, const BayerLayout &bl)
 {
-    w = bw / 2;
-    h = bh / 2;
+    w = bw / 2; h = bh / 2;
     size_t npix = (size_t)w * h;
-    r.resize(npix); g.resize(npix); b.resize(npix);
-
-#ifdef HAVE_OPENCV
-    // OpenCV: bilinear demosaic at full resolution, INTER_AREA downsample to half.
-    // Pattern mapping: XY in COLOR_BayerXY2BGR = top-left pixel X, top-right pixel Y.
-    if (backend == Backend::OpenCV)
-    {
-        int cvCode = -1;
-        if      (pat == "RGGB") cvCode = cv::COLOR_BayerRG2BGR;
-        else if (pat == "GRBG") cvCode = cv::COLOR_BayerGR2BGR;
-        else if (pat == "GBRG") cvCode = cv::COLOR_BayerGB2BGR;
-        else if (pat == "BGGR") cvCode = cv::COLOR_BayerBG2BGR;
-
-        if (cvCode >= 0)
-        {
-            cv::Mat src(bh, bw, CV_32F, const_cast<Pix *>(bayer.data()));
-            double minVal, maxVal;
-            cv::minMaxIdx(src, &minVal, &maxVal);
-            if (maxVal <= minVal) maxVal = minVal + 1.0;
-            cv::Mat src16;
-            src.convertTo(src16, CV_16U, 65535.0 / (maxVal - minVal),
-                          -minVal * 65535.0 / (maxVal - minVal));
-            cv::Mat bgr16;
-            cv::cvtColor(src16, bgr16, cvCode);
-            cv::Mat bgr16half;
-            cv::resize(bgr16, bgr16half, cv::Size(w, h), 0, 0, cv::INTER_AREA);
-            vector<cv::Mat> chans(3);
-            cv::split(bgr16half, chans);   // chans[0]=B [1]=G [2]=R
-            double invScale = (maxVal - minVal) / 65535.0;
-            for (int c = 0; c < 3; ++c)
-                chans[c].convertTo(chans[c], CV_32F, invScale, minVal);
-            std::copy((Pix*)chans[2].datastart, (Pix*)chans[2].dataend, r.begin());
-            std::copy((Pix*)chans[1].datastart, (Pix*)chans[1].dataend, g.begin());
-            std::copy((Pix*)chans[0].datastart, (Pix*)chans[0].dataend, b.begin());
-            return;
-        }
-    }
-#else
-    (void)pat; (void)backend;
-#endif
-
-    // Native: 2x2 cell average (fast, half-resolution).
-    const int rr = bl.r  >> 1, rc  = bl.r  & 1;
-    const int g1r= bl.g1 >> 1, g1c = bl.g1 & 1;
-    const int g2r= bl.g2 >> 1, g2c = bl.g2 & 1;
-    const int br = bl.b  >> 1, bc  = bl.b  & 1;
+    R.resize(npix); G1.resize(npix); G2.resize(npix); B.resize(npix);
+    const int rr  = bl.r  >> 1, rc  = bl.r  & 1;
+    const int g1r = bl.g1 >> 1, g1c = bl.g1 & 1;
+    const int g2r = bl.g2 >> 1, g2c = bl.g2 & 1;
+    const int br  = bl.b  >> 1, bc  = bl.b  & 1;
     for (int row = 0; row < h; ++row)
         for (int col = 0; col < w; ++col)
         {
             size_t i = (size_t)row * w + col;
-            r[i] = bayer[(size_t)(2*row + rr)  * bw + (2*col + rc)];
-            g[i] = (bayer[(size_t)(2*row + g1r) * bw + (2*col + g1c)] +
-                    bayer[(size_t)(2*row + g2r)  * bw + (2*col + g2c)]) * 0.5f;
-            b[i] = bayer[(size_t)(2*row + br)   * bw + (2*col + bc)];
+            R [i] = bayer[(size_t)(2*row + rr)  * bw + (2*col + rc )];
+            G1[i] = bayer[(size_t)(2*row + g1r) * bw + (2*col + g1c)];
+            G2[i] = bayer[(size_t)(2*row + g2r) * bw + (2*col + g2c)];
+            B [i] = bayer[(size_t)(2*row + br)  * bw + (2*col + bc )];
         }
 }
+
+// OpenCV bilinear demosaic + 2x2 INTER_AREA downsample to half resolution.
+// Only compiled when HAVE_OPENCV is defined.
+#ifdef HAVE_OPENCV
+static void debayerOpenCV(const vector<Pix> &bayer, int bw, int bh,
+    vector<Pix> &r, vector<Pix> &g, vector<Pix> &b,
+    int &w, int &h, const BayerLayout &bl, const string &pat)
+{
+    w = bw / 2; h = bh / 2;
+    size_t npix = (size_t)w * h;
+    r.resize(npix); g.resize(npix); b.resize(npix);
+
+    int cvCode = -1;
+    if      (pat == "RGGB") cvCode = cv::COLOR_BayerRG2BGR;
+    else if (pat == "GRBG") cvCode = cv::COLOR_BayerGR2BGR;
+    else if (pat == "GBRG") cvCode = cv::COLOR_BayerGB2BGR;
+    else if (pat == "BGGR") cvCode = cv::COLOR_BayerBG2BGR;
+
+    if (cvCode < 0) return;
+
+    cv::Mat src(bh, bw, CV_32F, const_cast<Pix *>(bayer.data()));
+    double minVal, maxVal;
+    cv::minMaxIdx(src, &minVal, &maxVal);
+    if (maxVal <= minVal) maxVal = minVal + 1.0;
+    cv::Mat src16;
+    src.convertTo(src16, CV_16U, 65535.0 / (maxVal - minVal),
+                  -minVal * 65535.0 / (maxVal - minVal));
+    cv::Mat bgr16;
+    cv::cvtColor(src16, bgr16, cvCode);
+    cv::Mat bgr16half;
+    cv::resize(bgr16, bgr16half, cv::Size(w, h), 0, 0, cv::INTER_AREA);
+    vector<cv::Mat> chans(3);
+    cv::split(bgr16half, chans);   // chans[0]=B [1]=G [2]=R
+    double invScale = (maxVal - minVal) / 65535.0;
+    for (int c = 0; c < 3; ++c)
+        chans[c].convertTo(chans[c], CV_32F, invScale, minVal);
+    std::copy((Pix*)chans[2].datastart, (Pix*)chans[2].dataend, r.begin());
+    std::copy((Pix*)chans[1].datastart, (Pix*)chans[1].dataend, g.begin());
+    std::copy((Pix*)chans[0].datastart, (Pix*)chans[0].dataend, b.begin());
+    (void)bl;
+}
+#endif // HAVE_OPENCV
 
 // ---------------------------------------------------------------------------
 // Bicubic helpers
@@ -658,6 +656,180 @@ static void alignFrame3(
 }
 
 // ---------------------------------------------------------------------------
+// Fused 4-channel bicubic warp (R, G1, G2, B subplanes).
+// ---------------------------------------------------------------------------
+
+static void alignFrame4rows(
+    const vector<Pix> &srcR, const vector<Pix> &srcG1,
+    const vector<Pix> &srcG2, const vector<Pix> &srcB,
+    int w, int h,
+    const Donuts::AffineMatrix &m,
+    vector<Pix> &dstR, vector<Pix> &dstG1,
+    vector<Pix> &dstG2, vector<Pix> &dstB,
+    vector<uint8_t> &mask,
+    int ylo, int yhi)
+{
+    for (int y = ylo; y < yhi; ++y)
+    {
+        const double sx0 = m.b * y + m.tx;
+        const double sy0 = m.d * y + m.ty;
+
+        auto [xInLo, xInHi] = interiorXRange(sx0, sy0, m.a, m.c, w, h);
+
+        auto slowPixel = [&](int x)
+        {
+            const double sx = m.a * x + sx0;
+            const double sy = m.c * x + sy0;
+            const size_t k  = (size_t)y * w + x;
+            if (sx < 0.0 || sx >= w || sy < 0.0 || sy >= h) { mask[k] = 0; return; }
+            const int   ix = (int)sx, iy = (int)sy;
+            const float fx = (float)(sx - ix), fy = (float)(sy - iy);
+            float wx[4], wy[4];
+            cubicWeights4(fx, wx);
+            cubicWeights4(fy, wy);
+            mask[k] = 1;
+            float vR = 0.0f, vG1 = 0.0f, vG2 = 0.0f, vB = 0.0f;
+            for (int dr = -1; dr <= 2; ++dr)
+            {
+                const int   py  = std::max(0, std::min(h - 1, iy + dr));
+                const float wyd = wy[dr + 1];
+                for (int dc = -1; dc <= 2; ++dc)
+                {
+                    const int    px  = std::max(0, std::min(w - 1, ix + dc));
+                    const float  wdc = wx[dc + 1] * wyd;
+                    const size_t s   = (size_t)py * w + px;
+                    vR  += wdc * srcR [s];
+                    vG1 += wdc * srcG1[s];
+                    vG2 += wdc * srcG2[s];
+                    vB  += wdc * srcB [s];
+                }
+            }
+            dstR[k] = vR; dstG1[k] = vG1; dstG2[k] = vG2; dstB[k] = vB;
+        };
+
+        for (int x = 0; x < xInLo; ++x) slowPixel(x);
+
+        for (int x = xInLo; x <= xInHi; ++x)
+        {
+            const double sx = m.a * x + sx0;
+            const double sy = m.c * x + sy0;
+            const size_t k  = (size_t)y * w + x;
+            const int   ix = (int)sx, iy = (int)sy;
+            const float fx = (float)(sx - ix), fy = (float)(sy - iy);
+            float wx[4], wy[4];
+            cubicWeights4(fx, wx);
+            cubicWeights4(fy, wy);
+            mask[k] = 1;
+#ifdef __ARM_NEON
+            const float32x4_t wxv = vld1q_f32(wx);
+            float32x4_t accVR  = vdupq_n_f32(0.0f);
+            float32x4_t accVG1 = vdupq_n_f32(0.0f);
+            float32x4_t accVG2 = vdupq_n_f32(0.0f);
+            float32x4_t accVB  = vdupq_n_f32(0.0f);
+            for (int dr = 0; dr < 4; ++dr)
+            {
+                const size_t      base = (size_t)(iy + dr - 1) * w + (ix - 1);
+                const float32x4_t wyd  = vdupq_n_f32(wy[dr]);
+                accVR  = vmlaq_f32(accVR,  vmulq_f32(vld1q_f32(srcR .data() + base), wxv), wyd);
+                accVG1 = vmlaq_f32(accVG1, vmulq_f32(vld1q_f32(srcG1.data() + base), wxv), wyd);
+                accVG2 = vmlaq_f32(accVG2, vmulq_f32(vld1q_f32(srcG2.data() + base), wxv), wyd);
+                accVB  = vmlaq_f32(accVB,  vmulq_f32(vld1q_f32(srcB .data() + base), wxv), wyd);
+            }
+            dstR [k] = hsum_neon(accVR);
+            dstG1[k] = hsum_neon(accVG1);
+            dstG2[k] = hsum_neon(accVG2);
+            dstB [k] = hsum_neon(accVB);
+#elif defined(__SSE2__)
+            const __m128 wxv = _mm_loadu_ps(wx);
+            __m128 accVR  = _mm_setzero_ps();
+            __m128 accVG1 = _mm_setzero_ps();
+            __m128 accVG2 = _mm_setzero_ps();
+            __m128 accVB  = _mm_setzero_ps();
+            for (int dr = 0; dr < 4; ++dr)
+            {
+                const size_t base = (size_t)(iy + dr - 1) * w + (ix - 1);
+                const __m128 wxw  = _mm_mul_ps(wxv, _mm_set1_ps(wy[dr]));
+                accVR  = _mm_add_ps(accVR,  _mm_mul_ps(_mm_loadu_ps(srcR .data() + base), wxw));
+                accVG1 = _mm_add_ps(accVG1, _mm_mul_ps(_mm_loadu_ps(srcG1.data() + base), wxw));
+                accVG2 = _mm_add_ps(accVG2, _mm_mul_ps(_mm_loadu_ps(srcG2.data() + base), wxw));
+                accVB  = _mm_add_ps(accVB,  _mm_mul_ps(_mm_loadu_ps(srcB .data() + base), wxw));
+            }
+            dstR [k] = hsum_ps(accVR);
+            dstG1[k] = hsum_ps(accVG1);
+            dstG2[k] = hsum_ps(accVG2);
+            dstB [k] = hsum_ps(accVB);
+#else
+            float vR = 0.0f, vG1 = 0.0f, vG2 = 0.0f, vB = 0.0f;
+            for (int dr = 0; dr < 4; ++dr)
+            {
+                const size_t base = (size_t)(iy + dr - 1) * w + (ix - 1);
+                const float  wyd  = wy[dr];
+                for (int dc = 0; dc < 4; ++dc)
+                {
+                    const float  wdc = wx[dc] * wyd;
+                    const size_t s   = base + dc;
+                    vR  += wdc * srcR [s];
+                    vG1 += wdc * srcG1[s];
+                    vG2 += wdc * srcG2[s];
+                    vB  += wdc * srcB [s];
+                }
+            }
+            dstR [k] = vR; dstG1[k] = vG1; dstG2[k] = vG2; dstB[k] = vB;
+#endif
+        }
+
+        for (int x = xInHi + 1; x < w; ++x) slowPixel(x);
+    }
+}
+
+static void alignFrame4(
+    const vector<Pix> &srcR, const vector<Pix> &srcG1,
+    const vector<Pix> &srcG2, const vector<Pix> &srcB,
+    int w, int h,
+    const Donuts::AffineMatrix &m,
+    vector<Pix> &dstR, vector<Pix> &dstG1,
+    vector<Pix> &dstG2, vector<Pix> &dstB,
+    vector<uint8_t> &mask,
+    int nThreads,
+    Backend backend = Backend::Native)
+{
+#ifdef HAVE_OPENCV
+    if (backend == Backend::OpenCV)
+    {
+        cv::Mat M_cv = (cv::Mat_<double>(2, 3) << m.a, m.b, m.tx, m.c, m.d, m.ty);
+        cv::Size sz(w, h);
+        const int flags = cv::INTER_CUBIC | cv::WARP_INVERSE_MAP;
+        cv::Mat cvR  (h, w, CV_32F, const_cast<Pix *>(srcR .data()));
+        cv::Mat cvG1 (h, w, CV_32F, const_cast<Pix *>(srcG1.data()));
+        cv::Mat cvG2 (h, w, CV_32F, const_cast<Pix *>(srcG2.data()));
+        cv::Mat cvB  (h, w, CV_32F, const_cast<Pix *>(srcB .data()));
+        cv::Mat outR (h, w, CV_32F, dstR .data());
+        cv::Mat outG1(h, w, CV_32F, dstG1.data());
+        cv::Mat outG2(h, w, CV_32F, dstG2.data());
+        cv::Mat outB (h, w, CV_32F, dstB .data());
+        cv::warpAffine(cvR,  outR,  M_cv, sz, flags, cv::BORDER_CONSTANT, 0);
+        cv::warpAffine(cvG1, outG1, M_cv, sz, flags, cv::BORDER_CONSTANT, 0);
+        cv::warpAffine(cvG2, outG2, M_cv, sz, flags, cv::BORDER_CONSTANT, 0);
+        cv::warpAffine(cvB,  outB,  M_cv, sz, flags, cv::BORDER_CONSTANT, 0);
+        cv::Mat ones = cv::Mat::ones(h, w, CV_32F);
+        cv::Mat warpedOnes;
+        cv::warpAffine(ones, warpedOnes, M_cv, sz,
+                       cv::INTER_NEAREST | cv::WARP_INVERSE_MAP, cv::BORDER_CONSTANT, 0);
+        const float *mp = warpedOnes.ptr<float>();
+        for (int k = 0; k < w * h; ++k) mask[k] = mp[k] > 0.5f ? 1 : 0;
+        return;
+    }
+#else
+    (void)backend;
+#endif
+    parallelFor(h, nThreads, [&](int ylo, int yhi)
+    {
+        alignFrame4rows(srcR, srcG1, srcG2, srcB, w, h, m,
+                        dstR, dstG1, dstG2, dstB, mask, ylo, yhi);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Per-pixel combine helpers -- caller provides scratch[depth]; no malloc here.
 // ---------------------------------------------------------------------------
 
@@ -713,20 +885,22 @@ static Pix pixelSigmaClip(const Pix *vals, Pix *scratch, Pix *devbuf,
 // Gathering non-NaN values per pixel is strided (one hop per frame) but this
 // is a one-time pass so cache miss cost is acceptable.
 // Each thread allocates scratch buffers of size nFrames -- no per-pixel malloc.
-static void reduceStack3(
+static void reduceStack4(
     const vector<vector<Pix>> &stkR,
-    const vector<vector<Pix>> &stkG,
+    const vector<vector<Pix>> &stkG1,
+    const vector<vector<Pix>> &stkG2,
     const vector<vector<Pix>> &stkB,
     size_t npix,
     StackMode mode, double kappa, int nThreads,
-    vector<Pix> &outR, vector<Pix> &outG, vector<Pix> &outB)
+    vector<Pix> &outR, vector<Pix> &outG1,
+    vector<Pix> &outG2, vector<Pix> &outB)
 {
     const int nFrames = (int)stkR.size();
-    outR.resize(npix); outG.resize(npix); outB.resize(npix);
+    outR.resize(npix); outG1.resize(npix); outG2.resize(npix); outB.resize(npix);
 
     parallelFor((int)npix, nThreads, [&](int klo, int khi)
     {
-        vector<Pix> gR(nFrames), gG(nFrames), gB(nFrames);
+        vector<Pix> gR(nFrames), gG1(nFrames), gG2(nFrames), gB(nFrames);
         vector<Pix> scratch(nFrames), devbuf(nFrames);
         for (int k = klo; k < khi; ++k)
         {
@@ -736,23 +910,26 @@ static void reduceStack3(
             {
                 Pix v = stkR[f][k];
                 if (std::isnan(v)) continue;
-                gR[n] = v;
-                gG[n] = stkG[f][k];
-                gB[n] = stkB[f][k];
+                gR [n] = v;
+                gG1[n] = stkG1[f][k];
+                gG2[n] = stkG2[f][k];
+                gB [n] = stkB [f][k];
                 ++n;
             }
-            if (n == 0) { outR[k] = outG[k] = outB[k] = 0.0f; continue; }
+            if (n == 0) { outR[k] = outG1[k] = outG2[k] = outB[k] = 0.0f; continue; }
             if (mode == StackMode::Median)
             {
-                outR[k] = pixelMedian   (gR.data(), scratch.data(), n);
-                outG[k] = pixelMedian   (gG.data(), scratch.data(), n);
-                outB[k] = pixelMedian   (gB.data(), scratch.data(), n);
+                outR [k] = pixelMedian   (gR .data(), scratch.data(), n);
+                outG1[k] = pixelMedian   (gG1.data(), scratch.data(), n);
+                outG2[k] = pixelMedian   (gG2.data(), scratch.data(), n);
+                outB [k] = pixelMedian   (gB .data(), scratch.data(), n);
             }
             else
             {
-                outR[k] = pixelSigmaClip(gR.data(), scratch.data(), devbuf.data(), n, kappa);
-                outG[k] = pixelSigmaClip(gG.data(), scratch.data(), devbuf.data(), n, kappa);
-                outB[k] = pixelSigmaClip(gB.data(), scratch.data(), devbuf.data(), n, kappa);
+                outR [k] = pixelSigmaClip(gR .data(), scratch.data(), devbuf.data(), n, kappa);
+                outG1[k] = pixelSigmaClip(gG1.data(), scratch.data(), devbuf.data(), n, kappa);
+                outG2[k] = pixelSigmaClip(gG2.data(), scratch.data(), devbuf.data(), n, kappa);
+                outB [k] = pixelSigmaClip(gB .data(), scratch.data(), devbuf.data(), n, kappa);
             }
         }
     });
@@ -760,25 +937,26 @@ static void reduceStack3(
 
 // Seed Welford streaming state from a warm-up buffer of N frames.
 // Eliminates the first-frame vulnerability: if a satellite trail hits frame 1
-// or 2, Welford has no prior variance to reject it. Seeding runs G-channel
+// or 2, Welford has no prior variance to reject it. Seeding runs G1-channel
 // MAD sigma-clip per pixel across the N warm-up frames, then runs the Welford
 // recurrence on the survivors to produce a pristine {mean, M2} baseline.
 // After this call, wCount[k] >= 1 for all pixels with at least one valid sample;
 // the online streaming gate fires immediately on frame N+1.
-static void seedWelford3(
+static void seedWelford4(
     const vector<vector<Pix>> &warmR,
-    const vector<vector<Pix>> &warmG,
+    const vector<vector<Pix>> &warmG1,
+    const vector<vector<Pix>> &warmG2,
     const vector<vector<Pix>> &warmB,
     size_t npix, double kappa, int nThreads,
-    vector<Pix>      &wMeanR, vector<Pix>      &wMeanG, vector<Pix>      &wMeanB,
-    vector<Pix>      &wM2R,   vector<Pix>      &wM2G,   vector<Pix>      &wM2B,
+    vector<Pix>      &wMeanR,  vector<Pix>      &wMeanG1, vector<Pix>      &wMeanG2, vector<Pix>      &wMeanB,
+    vector<Pix>      &wM2R,    vector<Pix>      &wM2G1,   vector<Pix>      &wM2G2,   vector<Pix>      &wM2B,
     vector<uint32_t> &wCount)
 {
     const int nFrames = (int)warmR.size();
     parallelFor((int)npix, nThreads, [&](int klo, int khi)
     {
         // Per-thread scratch: nFrames entries each -- no per-pixel malloc.
-        vector<Pix> vG(nFrames), vR(nFrames), vB(nFrames);
+        vector<Pix> vG1(nFrames), vG2(nFrames), vR(nFrames), vB(nFrames);
         vector<Pix> scratch(nFrames), devbuf(nFrames);
         vector<int> survivorIdx(nFrames);
         for (int k = klo; k < khi; ++k)
@@ -787,25 +965,26 @@ static void seedWelford3(
             int n = 0;
             for (int f = 0; f < nFrames; ++f)
             {
-                Pix gv = warmG[f][k];
-                if (std::isnan(gv)) continue;
-                vG[n] = gv;
-                vR[n] = warmR[f][k];
-                vB[n] = warmB[f][k];
+                Pix g1v = warmG1[f][k];
+                if (std::isnan(g1v)) continue;
+                vG1[n] = g1v;
+                vG2[n] = warmG2[f][k];
+                vR [n] = warmR [f][k];
+                vB [n] = warmB [f][k];
                 survivorIdx[n] = n;
                 ++n;
             }
             if (n == 0) { wCount[k] = 0; continue; }
             if (n == 1)
             {
-                wMeanR[k] = vR[0]; wMeanG[k] = vG[0]; wMeanB[k] = vB[0];
-                wM2R[k] = 0.0f; wM2G[k] = 0.0f; wM2B[k] = 0.0f;
+                wMeanR [k] = vR [0]; wMeanG1[k] = vG1[0]; wMeanG2[k] = vG2[0]; wMeanB[k] = vB[0];
+                wM2R[k] = 0.0f; wM2G1[k] = 0.0f; wM2G2[k] = 0.0f; wM2B[k] = 0.0f;
                 wCount[k] = 1;
                 continue;
             }
 
-            // G-channel MAD sigma-clip: compact scratch[] and survivorIdx[] in parallel.
-            std::copy(vG.begin(), vG.begin() + n, scratch.begin());
+            // G1-channel MAD sigma-clip: compact scratch[] and survivorIdx[] in parallel.
+            std::copy(vG1.begin(), vG1.begin() + n, scratch.begin());
             std::iota(survivorIdx.begin(), survivorIdx.begin() + n, 0);
             int cnt = n;
             for (int iter = 0; iter < 5 && cnt > 2; ++iter)
@@ -832,21 +1011,195 @@ static void seedWelford3(
                 cnt = keep;
             }
 
-            // Welford recurrence over surviving {R, G, B} triplets.
-            float mR=0.0f, mG=0.0f, mB=0.0f, m2R=0.0f, m2G=0.0f, m2B=0.0f;
+            // Welford recurrence over surviving {R, G1, G2, B} quads.
+            float mR=0.0f, mG1=0.0f, mG2=0.0f, mB=0.0f;
+            float m2R=0.0f, m2G1=0.0f, m2G2=0.0f, m2B=0.0f;
             for (int i = 0; i < cnt; ++i)
             {
                 const int j = survivorIdx[i];
                 const float nf = (float)(i + 1);
                 float d;
-                d = vR[j] - mR; mR += d / nf; m2R += d * (vR[j] - mR);
-                d = vG[j] - mG; mG += d / nf; m2G += d * (vG[j] - mG);
-                d = vB[j] - mB; mB += d / nf; m2B += d * (vB[j] - mB);
+                d = vR [j] - mR;  mR  += d / nf; m2R  += d * (vR [j] - mR);
+                d = vG1[j] - mG1; mG1 += d / nf; m2G1 += d * (vG1[j] - mG1);
+                d = vG2[j] - mG2; mG2 += d / nf; m2G2 += d * (vG2[j] - mG2);
+                d = vB [j] - mB;  mB  += d / nf; m2B  += d * (vB [j] - mB);
             }
-            wMeanR[k] = mR; wMeanG[k] = mG; wMeanB[k] = mB;
-            wM2R[k]   = m2R; wM2G[k]  = m2G; wM2B[k]  = m2B;
+            wMeanR [k] = mR;  wMeanG1[k] = mG1; wMeanG2[k] = mG2; wMeanB[k] = mB;
+            wM2R   [k] = m2R; wM2G1  [k] = m2G1; wM2G2 [k] = m2G2; wM2B[k] = m2B;
             wCount[k] = (uint32_t)cnt;
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Post-stack Malvar-He-Cutler 2004 demosaicing at half resolution.
+//
+// Each output pixel (oi, oj) represents a 2x2 Bayer block. We compute MHC
+// interpolated R, G, B at each of the 4 full-resolution positions within that
+// block (R pos, G1 pos, G2 pos, B pos), then average the 4 estimates.
+// All array accesses use clamped indices to handle borders without branches.
+//
+// Bayer layout (RGGB assumed; handled via subplane order from extractSubplanes):
+//   R [oi][oj] = bayer[2oi  ][2oj  ]
+//   G1[oi][oj] = bayer[2oi  ][2oj+1]
+//   G2[oi][oj] = bayer[2oi+1][2oj  ]
+//   B [oi][oj] = bayer[2oi+1][2oj+1]
+// ---------------------------------------------------------------------------
+
+static void debayerMHC_halfres(
+    const vector<Pix> &R, const vector<Pix> &G1,
+    const vector<Pix> &G2, const vector<Pix> &B,
+    int w, int h,
+    vector<Pix> &outR, vector<Pix> &outG, vector<Pix> &outB,
+    int nThreads)
+{
+    size_t npix = (size_t)w * h;
+    outR.resize(npix); outG.resize(npix); outB.resize(npix);
+
+    // Clamped accessors into each subplane.
+    auto r  = [&](int i, int j) -> float { return R [std::clamp(i,0,h-1)*w + std::clamp(j,0,w-1)]; };
+    auto g1 = [&](int i, int j) -> float { return G1[std::clamp(i,0,h-1)*w + std::clamp(j,0,w-1)]; };
+    auto g2 = [&](int i, int j) -> float { return G2[std::clamp(i,0,h-1)*w + std::clamp(j,0,w-1)]; };
+    auto b  = [&](int i, int j) -> float { return B [std::clamp(i,0,h-1)*w + std::clamp(j,0,w-1)]; };
+
+    parallelFor(h, nThreads, [&](int ylo, int yhi)
+    {
+        for (int oi = ylo; oi < yhi; ++oi)
+            for (int oj = 0; oj < w; ++oj)
+            {
+                // --- R channel: average R value from all 4 full-res positions ---
+
+                // Position (2oi, 2oj): exact R sample.
+                float rR = r(oi, oj);
+
+                // Position (2oi, 2oj+1): G1 site -- K2 interpolates R along row.
+                float rGrb = (
+                     0.5f * g1(oi-1, oj  ) +
+                    -1.0f * g2(oi-1, oj  ) +
+                    -1.0f * g2(oi-1, oj+1) +
+                    -1.0f * g1(oi,   oj-1) +
+                     4.0f * r (oi,   oj  ) +
+                     5.0f * g1(oi,   oj  ) +
+                     4.0f * r (oi,   oj+1) +
+                    -1.0f * g1(oi,   oj+1) +
+                    -1.0f * g2(oi,   oj  ) +
+                    -1.0f * g2(oi,   oj+1) +
+                     0.5f * g1(oi+1, oj  )
+                ) * (1.0f / 8.0f);
+
+                // Position (2oi+1, 2oj): G2 site -- K3 interpolates R along column.
+                float rGbr = (
+                    -1.0f * g2(oi-1, oj  ) +
+                    -1.0f * g1(oi,   oj-1) +
+                     4.0f * r (oi,   oj  ) +
+                    -1.0f * g1(oi,   oj  ) +
+                     0.5f * g2(oi,   oj-1) +
+                     5.0f * g2(oi,   oj  ) +
+                     0.5f * g2(oi,   oj+1) +
+                    -1.0f * g1(oi+1, oj-1) +
+                     4.0f * r (oi+1, oj  ) +
+                    -1.0f * g1(oi+1, oj  ) +
+                    -1.0f * g2(oi+1, oj  )
+                ) * (1.0f / 8.0f);
+
+                // Position (2oi+1, 2oj+1): B site -- K4 interpolates R diagonally.
+                float rB = (
+                    -1.5f * b(oi-1, oj  ) +
+                     2.0f * r(oi,   oj  ) +
+                     2.0f * r(oi,   oj+1) +
+                    -1.5f * b(oi,   oj-1) +
+                     6.0f * b(oi,   oj  ) +
+                    -1.5f * b(oi,   oj+1) +
+                     2.0f * r(oi+1, oj  ) +
+                     2.0f * r(oi+1, oj+1) +
+                    -1.5f * b(oi+1, oj  )
+                ) * (1.0f / 8.0f);
+
+                // --- G channel: average G value from all 4 full-res positions ---
+
+                // Position (2oi, 2oj): R site -- K1 interpolates G.
+                float gR = (
+                    -1.0f * r (oi-1, oj  ) +
+                     2.0f * g2(oi-1, oj  ) +
+                    -1.0f * r (oi,   oj-1) +
+                     2.0f * g1(oi,   oj-1) +
+                     4.0f * r (oi,   oj  ) +
+                     2.0f * g1(oi,   oj  ) +
+                    -1.0f * r (oi,   oj+1) +
+                     2.0f * g2(oi,   oj  ) +
+                    -1.0f * r (oi+1, oj  )
+                ) * (1.0f / 8.0f);
+
+                // Positions (2oi, 2oj+1) and (2oi+1, 2oj): exact G samples.
+                float gGrb = g1(oi, oj);
+                float gGbr = g2(oi, oj);
+
+                // Position (2oi+1, 2oj+1): B site -- K1 interpolates G.
+                float gB = (
+                    -1.0f * b(oi-1, oj  ) +
+                     2.0f * g1(oi,   oj  ) +
+                    -1.0f * b(oi,   oj-1) +
+                     2.0f * g2(oi,   oj  ) +
+                     4.0f * b(oi,   oj  ) +
+                     2.0f * g2(oi,   oj+1) +
+                    -1.0f * b(oi,   oj+1) +
+                     2.0f * g1(oi+1, oj  ) +
+                    -1.0f * b(oi+1, oj  )
+                ) * (1.0f / 8.0f);
+
+                // --- B channel: average B value from all 4 full-res positions ---
+
+                // Position (2oi, 2oj): R site -- K4 interpolates B diagonally.
+                float bR = (
+                    -1.5f * r(oi-1, oj  ) +
+                     2.0f * b(oi-1, oj-1) +
+                     2.0f * b(oi-1, oj  ) +
+                    -1.5f * r(oi,   oj-1) +
+                     6.0f * r(oi,   oj  ) +
+                    -1.5f * r(oi,   oj+1) +
+                     2.0f * b(oi,   oj-1) +
+                     2.0f * b(oi,   oj  ) +
+                    -1.5f * r(oi+1, oj  )
+                ) * (1.0f / 8.0f);
+
+                // Position (2oi, 2oj+1): G1 site -- K3 interpolates B along column.
+                float bGrb = (
+                    -1.0f * g1(oi-1, oj  ) +
+                    -1.0f * g2(oi-1, oj  ) +
+                     4.0f * b (oi-1, oj  ) +
+                    -1.0f * g2(oi-1, oj+1) +
+                     0.5f * g1(oi,   oj-1) +
+                     5.0f * g1(oi,   oj  ) +
+                     0.5f * g1(oi,   oj+1) +
+                    -1.0f * g2(oi,   oj  ) +
+                     4.0f * b (oi,   oj  ) +
+                    -1.0f * g2(oi,   oj+1) +
+                    -1.0f * g1(oi+1, oj  )
+                ) * (1.0f / 8.0f);
+
+                // Position (2oi+1, 2oj): G2 site -- K2-variant interpolates B along row.
+                float bGbr = (
+                     0.5f * g2(oi-1, oj  ) +
+                    -1.0f * g1(oi,   oj-1) +
+                    -1.0f * g1(oi,   oj  ) +
+                    -1.0f * g2(oi,   oj-1) +
+                     4.0f * b (oi,   oj-1) +
+                     5.0f * g2(oi,   oj  ) +
+                     4.0f * b (oi,   oj  ) +
+                    -1.0f * g2(oi,   oj+1) +
+                    -1.0f * g1(oi+1, oj-1) +
+                    -1.0f * g1(oi+1, oj  ) +
+                     0.5f * g2(oi+1, oj  )
+                ) * (1.0f / 8.0f);
+
+                // Position (2oi+1, 2oj+1): exact B sample.
+                float bB = b(oi, oj);
+
+                size_t idx = (size_t)oi * w + oj;
+                outR[idx] = (rR + rGrb + rGbr + rB)   * 0.25f;
+                outG[idx] = (gR + gGrb + gGbr + gB)   * 0.25f;
+                outB[idx] = (bR + bGrb + bGbr + bB)   * 0.25f;
+            }
     });
 }
 
@@ -975,7 +1328,8 @@ int main(int argc, char **argv)
         cout << " warmup=" << wUpN;
     {
         const char *be = (backend == Backend::OpenCV) ? "opencv" : "native";
-        cout << "  warp=" << be << " debayer=" << be;
+        const char *db = (backend == Backend::OpenCV) ? "opencv" : "mhc";
+        cout << "  warp=" << be << " debayer=" << db;
     }
     cout << "  threads=" << nThreads << "\n";
 
@@ -1076,16 +1430,16 @@ int main(int argc, char **argv)
     int nAccepted = 1;
     for (const auto &fi : frames) if (fi.accepted) ++nAccepted;
 
-    vector<Pix> accumR(npix, 0.0f), accumG(npix, 0.0f), accumB(npix, 0.0f);
+    vector<Pix> accumR(npix, 0.0f), accumG1(npix, 0.0f), accumG2(npix, 0.0f), accumB(npix, 0.0f);
     vector<int> coverage(npix, 0);
 
     // Frame-major stacks: stkFrames*[frameIndex][pixelIndex].
     // Each accepted frame appends one vector<Pix>(npix) -- one allocation per frame,
     // no upfront bulk allocation. NaN marks masked-out pixels (border regions).
-    vector<vector<Pix>> stkFramesR, stkFramesG, stkFramesB;
+    vector<vector<Pix>> stkFramesR, stkFramesG1, stkFramesG2, stkFramesB;
     if (mode == StackMode::Median || mode == StackMode::SigmaClip)
     {
-        size_t mb = 3 * npix * (size_t)nAccepted * sizeof(Pix) / (1024*1024);
+        size_t mb = 4 * npix * (size_t)nAccepted * sizeof(Pix) / (1024*1024);
         if (mb > 4096)
             cerr << "Warning: median/sigmaclip estimated ~" << mb << " MB for "
                  << nAccepted << " frames; consider -m wstream.\n";
@@ -1093,21 +1447,22 @@ int main(int argc, char **argv)
             cout << "Pixel stacks: ~" << mb << " MB estimated ("
                  << nAccepted << " frames, allocated per-frame).\n";
         stkFramesR.reserve(nAccepted);
-        stkFramesG.reserve(nAccepted);
+        stkFramesG1.reserve(nAccepted);
+        stkFramesG2.reserve(nAccepted);
         stkFramesB.reserve(nAccepted);
     }
 
     // Welford streaming state: {mean, M2, count} per pixel -- O(pixels) memory
     // regardless of frame count. mean[] is the live stacked image at all times.
-    vector<Pix>      wMeanR, wMeanG, wMeanB;
-    vector<Pix>      wM2R,   wM2G,   wM2B;
+    vector<Pix>      wMeanR, wMeanG1, wMeanG2, wMeanB;
+    vector<Pix>      wM2R,   wM2G1,   wM2G2,   wM2B;
     vector<uint32_t> wCount;
     if (mode == StackMode::WelfordStream)
     {
-        wMeanR.assign(npix, 0.0f); wMeanG.assign(npix, 0.0f); wMeanB.assign(npix, 0.0f);
-        wM2R.assign(npix, 0.0f);   wM2G.assign(npix, 0.0f);   wM2B.assign(npix, 0.0f);
+        wMeanR.assign(npix, 0.0f); wMeanG1.assign(npix, 0.0f); wMeanG2.assign(npix, 0.0f); wMeanB.assign(npix, 0.0f);
+        wM2R.assign(npix, 0.0f);   wM2G1.assign(npix, 0.0f);   wM2G2.assign(npix, 0.0f);   wM2B.assign(npix, 0.0f);
         wCount.assign(npix, 0u);
-        size_t mb = (6 * sizeof(Pix) + sizeof(uint32_t)) * npix / (1024*1024);
+        size_t mb = (8 * sizeof(Pix) + sizeof(uint32_t)) * npix / (1024*1024);
         cout << "Welford streaming: " << mb << " MB (constant, frame-count-independent).\n";
     }
 
@@ -1115,19 +1470,21 @@ int main(int argc, char **argv)
 
     // Warm-up buffer for wstream mode: first wUpN accepted frames go here
     // for clean sigmaclip seeding of the Welford baseline.
-    vector<vector<Pix>> warmR, warmG, warmB;
+    vector<vector<Pix>> warmR, warmG1, warmG2, warmB;
     bool warmPhase = (mode == StackMode::WelfordStream && wUpN > 0);
     int  warmCount = 0;
     if (warmPhase)
     {
         warmR.reserve(wUpN);
-        warmG.reserve(wUpN);
+        warmG1.reserve(wUpN);
+        warmG2.reserve(wUpN);
         warmB.reserve(wUpN);
     }
 
     // Threaded accumulate: pixel ranges are disjoint across threads -- no locking.
-    auto accumulateFrame = [&](const vector<Pix> &r, const vector<Pix> &g,
-                               const vector<Pix> &b, const vector<uint8_t> *maskPtr)
+    auto accumulateFrame = [&](const vector<Pix> &r, const vector<Pix> &g1,
+                               const vector<Pix> &g2, const vector<Pix> &b,
+                               const vector<uint8_t> *maskPtr)
     {
         if (mode == StackMode::Mean)
         {
@@ -1136,7 +1493,7 @@ int main(int argc, char **argv)
                 for (int k = klo; k < khi; ++k)
                 {
                     if (maskPtr && !(*maskPtr)[k]) continue;
-                    accumR[k] += r[k]; accumG[k] += g[k]; accumB[k] += b[k];
+                    accumR[k] += r[k]; accumG1[k] += g1[k]; accumG2[k] += g2[k]; accumB[k] += b[k];
                     coverage[k]++;
                 }
             });
@@ -1148,7 +1505,8 @@ int main(int argc, char **argv)
             try
             {
                 stkFramesR.push_back(vector<Pix>(npix, kNaN));
-                stkFramesG.push_back(vector<Pix>(npix, kNaN));
+                stkFramesG1.push_back(vector<Pix>(npix, kNaN));
+                stkFramesG2.push_back(vector<Pix>(npix, kNaN));
                 stkFramesB.push_back(vector<Pix>(npix, kNaN));
             }
             catch (const std::bad_alloc &)
@@ -1157,15 +1515,16 @@ int main(int argc, char **argv)
                      << stkFramesR.size() << "). Use -m wstream.\n";
                 return;
             }
-            Pix *fr = stkFramesR.back().data();
-            Pix *fg = stkFramesG.back().data();
-            Pix *fb = stkFramesB.back().data();
+            Pix *fr  = stkFramesR.back().data();
+            Pix *fg1 = stkFramesG1.back().data();
+            Pix *fg2 = stkFramesG2.back().data();
+            Pix *fb  = stkFramesB.back().data();
             parallelFor((int)npix, nThreads, [&](int klo, int khi)
             {
                 for (int k = klo; k < khi; ++k)
                 {
                     if (maskPtr && !(*maskPtr)[k]) continue;
-                    fr[k] = r[k]; fg[k] = g[k]; fb[k] = b[k];
+                    fr[k] = r[k]; fg1[k] = g1[k]; fg2[k] = g2[k]; fb[k] = b[k];
                 }
             });
         }
@@ -1174,12 +1533,13 @@ int main(int argc, char **argv)
     // Welford online update for streaming sigma-clip.
     // bootstrap=true for the reference frame: always accept, no gate.
     // bootstrap=false for subsequent frames: gate with kappa*sigma before update.
-    // Gate uses the G channel only: satellites are broadband so G is sufficient,
-    // and single-channel gating avoids false rejection of chromatic targets.
+    // Gate uses (G1+G2)*0.5: satellites are broadband and both green channels
+    // measure the same signal; averaging gives a cleaner gate estimate.
     // Requires n >= 2 to have a meaningful variance estimate; earlier samples
     // are always accepted to seed the statistics.
-    auto welfordFrame = [&](const vector<Pix> &r, const vector<Pix> &g,
-                            const vector<Pix> &b, const vector<uint8_t> *maskPtr,
+    auto welfordFrame = [&](const vector<Pix> &r, const vector<Pix> &g1,
+                            const vector<Pix> &g2, const vector<Pix> &b,
+                            const vector<uint8_t> *maskPtr,
                             bool bootstrap)
     {
         const float kf = (float)kappa;
@@ -1190,14 +1550,13 @@ int main(int argc, char **argv)
                 if (maskPtr && !(*maskPtr)[k]) continue;
                 uint32_t n = wCount[k];
 
-                // Rejection gate: use G channel only.
-                // Satellite/airplane trails are broadband -- G catches them just as
-                // well as per-channel. Single-channel gating avoids false rejection
-                // of chromatic targets (e.g. red stars with legitimately high R variance).
-                if (!bootstrap && n >= 2 && wM2G[k] > 0.0f)
+                // Rejection gate: use (G1+G2)*0.5 -- exact measured values,
+                // better gate estimate than G1 alone.
+                if (!bootstrap && n >= 2 && wM2G1[k] > 0.0f)
                 {
-                    float sig = std::sqrt(wM2G[k] / (float)(n - 1));
-                    if (std::abs(g[k] - wMeanG[k]) > kf * sig)
+                    float gAvg = (g1[k] + g2[k]) * 0.5f;
+                    float sig = std::sqrt(wM2G1[k] / (float)(n - 1));
+                    if (std::abs(gAvg - wMeanG1[k]) > kf * sig)
                         continue;
                 }
 
@@ -1205,22 +1564,25 @@ int main(int argc, char **argv)
                 ++n;
                 const float nf = (float)n;
                 float d;
-                d = r[k] - wMeanR[k]; wMeanR[k] += d / nf; wM2R[k] += d * (r[k] - wMeanR[k]);
-                d = g[k] - wMeanG[k]; wMeanG[k] += d / nf; wM2G[k] += d * (g[k] - wMeanG[k]);
-                d = b[k] - wMeanB[k]; wMeanB[k] += d / nf; wM2B[k] += d * (b[k] - wMeanB[k]);
+                d = r [k] - wMeanR [k]; wMeanR [k] += d / nf; wM2R [k] += d * (r [k] - wMeanR [k]);
+                d = g1[k] - wMeanG1[k]; wMeanG1[k] += d / nf; wM2G1[k] += d * (g1[k] - wMeanG1[k]);
+                d = g2[k] - wMeanG2[k]; wMeanG2[k] += d / nf; wM2G2[k] += d * (g2[k] - wMeanG2[k]);
+                d = b [k] - wMeanB [k]; wMeanB [k] += d / nf; wM2B [k] += d * (b [k] - wMeanB [k]);
                 wCount[k] = n;
             }
         });
     };
 
     // Append one frame to the warm-up buffer (NaN-sentinel frame-major layout).
-    auto addToWarmBuffer = [&](const vector<Pix> &r, const vector<Pix> &g,
-                               const vector<Pix> &b, const vector<uint8_t> *maskPtr)
+    auto addToWarmBuffer = [&](const vector<Pix> &r, const vector<Pix> &g1,
+                               const vector<Pix> &g2, const vector<Pix> &b,
+                               const vector<uint8_t> *maskPtr)
     {
         try
         {
             warmR.push_back(vector<Pix>(npix, kNaN));
-            warmG.push_back(vector<Pix>(npix, kNaN));
+            warmG1.push_back(vector<Pix>(npix, kNaN));
+            warmG2.push_back(vector<Pix>(npix, kNaN));
             warmB.push_back(vector<Pix>(npix, kNaN));
         }
         catch (const std::bad_alloc &)
@@ -1229,15 +1591,16 @@ int main(int argc, char **argv)
             warmPhase = false;
             return;
         }
-        Pix *fr = warmR.back().data();
-        Pix *fg = warmG.back().data();
-        Pix *fb = warmB.back().data();
+        Pix *fr  = warmR .back().data();
+        Pix *fg1 = warmG1.back().data();
+        Pix *fg2 = warmG2.back().data();
+        Pix *fb  = warmB .back().data();
         parallelFor((int)npix, nThreads, [&](int klo, int khi)
         {
             for (int k = klo; k < khi; ++k)
             {
                 if (maskPtr && !(*maskPtr)[k]) continue;
-                fr[k] = r[k]; fg[k] = g[k]; fb[k] = b[k];
+                fr[k] = r[k]; fg1[k] = g1[k]; fg2[k] = g2[k]; fb[k] = b[k];
             }
         });
         ++warmCount;
@@ -1247,12 +1610,13 @@ int main(int argc, char **argv)
     auto flushWarmBuffer = [&]()
     {
         cout << "Seeding Welford from " << warmCount << " warm-up frame"
-             << (warmCount == 1 ? "" : "s") << " (G-channel MAD sigmaclip seed)...\n";
-        seedWelford3(warmR, warmG, warmB, npix, kappa, nThreads,
-                     wMeanR, wMeanG, wMeanB, wM2R, wM2G, wM2B, wCount);
-        warmR.clear(); warmR.shrink_to_fit();
-        warmG.clear(); warmG.shrink_to_fit();
-        warmB.clear(); warmB.shrink_to_fit();
+             << (warmCount == 1 ? "" : "s") << " (G1-channel MAD sigmaclip seed)...\n";
+        seedWelford4(warmR, warmG1, warmG2, warmB, npix, kappa, nThreads,
+                     wMeanR, wMeanG1, wMeanG2, wMeanB, wM2R, wM2G1, wM2G2, wM2B, wCount);
+        warmR .clear(); warmR .shrink_to_fit();
+        warmG1.clear(); warmG1.shrink_to_fit();
+        warmG2.clear(); warmG2.shrink_to_fit();
+        warmB .clear(); warmB .shrink_to_fit();
         warmPhase = false;
     };
 
@@ -1266,7 +1630,7 @@ int main(int argc, char **argv)
         return std::chrono::duration_cast<Sec>(Clock::now() - t0).count();
     };
 
-    double t_io = 0, t_debayer = 0, t_warp = 0, t_stack = 0;
+    double t_io = 0, t_subplane = 0, t_warp = 0, t_stack = 0, t_mhc = 0;
     Clock::time_point t0;
 
     // ------------------------------------------------------------------
@@ -1274,20 +1638,28 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
 
     {
-        vector<Pix> r, g, b;
+        vector<Pix> r, g1, g2, b;
         if (bayer)
         {
             t0 = Clock::now();
             int tw=0,th=0;
-            debayer(refRaw, bw, bh, r, g, b, tw, th, refLayout, refPat, backend);
-            t_debayer += since(t0);
+#ifdef HAVE_OPENCV
+            if (backend == Backend::OpenCV)
+            {
+                debayerOpenCV(refRaw, bw, bh, r, g1, b, tw, th, refLayout, refPat);
+                g2 = g1;
+            }
+            else
+#endif
+            extractSubplanes(refRaw, bw, bh, r, g1, g2, b, tw, th, refLayout);
+            t_subplane += since(t0);
         }
-        else { r = refRaw; g = refRaw; b = refRaw; }
+        else { r = refRaw; g1 = refRaw; g2 = refRaw; b = refRaw; }
 
         t0 = Clock::now();
-        if      (warmPhase)                        addToWarmBuffer(r, g, b, nullptr);
-        else if (mode == StackMode::WelfordStream) welfordFrame(r, g, b, nullptr, true);
-        else                                       accumulateFrame(r, g, b, nullptr);
+        if      (warmPhase)                        addToWarmBuffer(r, g1, g2, b, nullptr);
+        else if (mode == StackMode::WelfordStream) welfordFrame(r, g1, g2, b, nullptr, true);
+        else                                       accumulateFrame(r, g1, g2, b, nullptr);
         t_stack += since(t0);
     }
 
@@ -1306,32 +1678,40 @@ int main(int argc, char **argv)
         t_io += since(t0);
         if (raw.empty()) continue;
 
-        vector<Pix> r, g, b;
+        vector<Pix> r, g1, g2, b;
         if (bayer)
         {
             t0 = Clock::now();
             int tw=0,th=0;
-            debayer(raw, fw, fh, r, g, b, tw, th, refLayout, refPat, backend);
-            t_debayer += since(t0);
+#ifdef HAVE_OPENCV
+            if (backend == Backend::OpenCV)
+            {
+                debayerOpenCV(raw, fw, fh, r, g1, b, tw, th, refLayout, refPat);
+                g2 = g1;
+            }
+            else
+#endif
+            extractSubplanes(raw, fw, fh, r, g1, g2, b, tw, th, refLayout);
+            t_subplane += since(t0);
         }
-        else { r = raw; g = raw; b = raw; }
+        else { r = raw; g1 = raw; g2 = raw; b = raw; }
 
-        vector<Pix>     dstR(npix), dstG(npix), dstB(npix);
+        vector<Pix>     dstR(npix), dstG1(npix), dstG2(npix), dstB(npix);
         vector<uint8_t> mask(npix, 0);
 
         t0 = Clock::now();
         const auto M = fi.t.alignmentMatrix(dw, dh);
-        alignFrame3(r, g, b, dw, dh, M, dstR, dstG, dstB, mask, nThreads, backend);
+        alignFrame4(r, g1, g2, b, dw, dh, M, dstR, dstG1, dstG2, dstB, mask, nThreads, backend);
         t_warp += since(t0);
 
         t0 = Clock::now();
         if (warmPhase)
         {
-            addToWarmBuffer(dstR, dstG, dstB, &mask);
+            addToWarmBuffer(dstR, dstG1, dstG2, dstB, &mask);
             if (warmCount >= wUpN) flushWarmBuffer();
         }
-        else if (mode == StackMode::WelfordStream) welfordFrame(dstR, dstG, dstB, &mask, false);
-        else                                       accumulateFrame(dstR, dstG, dstB, &mask);
+        else if (mode == StackMode::WelfordStream) welfordFrame(dstR, dstG1, dstG2, dstB, &mask, false);
+        else                                       accumulateFrame(dstR, dstG1, dstG2, dstB, &mask);
         t_stack += since(t0);
         ++stackCount;
     }
@@ -1346,12 +1726,12 @@ int main(int argc, char **argv)
     // Reduce to final image.
     // ------------------------------------------------------------------
 
-    vector<Pix> finalR(npix), finalG(npix), finalB(npix);
+    vector<Pix> finalR(npix), finalG1(npix), finalG2(npix), finalB(npix);
 
     if (mode == StackMode::WelfordStream)
     {
         // mean[] is already the final stacked image -- no separate reduce pass needed.
-        finalR = wMeanR; finalG = wMeanG; finalB = wMeanB;
+        finalR = wMeanR; finalG1 = wMeanG1; finalG2 = wMeanG2; finalB = wMeanB;
     }
     else if (mode == StackMode::Mean)
     {
@@ -1360,16 +1740,33 @@ int main(int argc, char **argv)
             for (int k = klo; k < khi; ++k)
             {
                 float inv = coverage[k] > 0 ? 1.0f / coverage[k] : 0.0f;
-                finalR[k] = accumR[k] * inv;
-                finalG[k] = accumG[k] * inv;
-                finalB[k] = accumB[k] * inv;
+                finalR [k] = accumR [k] * inv;
+                finalG1[k] = accumG1[k] * inv;
+                finalG2[k] = accumG2[k] * inv;
+                finalB [k] = accumB [k] * inv;
             }
         });
     }
     else
     {
-        reduceStack3(stkFramesR, stkFramesG, stkFramesB, npix,
-                     mode, kappa, nThreads, finalR, finalG, finalB);
+        reduceStack4(stkFramesR, stkFramesG1, stkFramesG2, stkFramesB, npix,
+                     mode, kappa, nThreads, finalR, finalG1, finalG2, finalB);
+    }
+
+    // Post-stack debayer: MHC for native backend; opencv used its own per-frame.
+    vector<Pix> finalRout(npix), finalG(npix), finalBout(npix);
+#ifdef HAVE_OPENCV
+    if (backend == Backend::OpenCV)
+    {
+        finalRout = finalR; finalG = finalG1; finalBout = finalB;
+    }
+    else
+#endif
+    {
+        t0 = Clock::now();
+        debayerMHC_halfres(finalR, finalG1, finalG2, finalB, dw, dh,
+                           finalRout, finalG, finalBout, nThreads);
+        t_mhc = since(t0);
     }
 
     // ------------------------------------------------------------------
@@ -1377,13 +1774,14 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
 
     {
-        double total = t_io + t_debayer + t_warp + t_stack;
+        double total = t_io + t_subplane + t_warp + t_stack + t_mhc;
         auto pct = [&](double t) { return total > 0 ? (int)(100.0 * t / total + 0.5) : 0; };
-        cout << "Timings (s):  io=" << t_io
-             << "  debayer=" << t_debayer << " (" << pct(t_debayer) << "%)"
-             << "  warp="    << t_warp    << " (" << pct(t_warp)    << "%)"
-             << "  stack="   << t_stack   << " (" << pct(t_stack)   << "%)"
-             << "  total="   << total     << "\n";
+        cout << "Timings (s):  io="       << t_io
+             << "  subplane=" << t_subplane << " (" << pct(t_subplane) << "%)"
+             << "  warp="     << t_warp     << " (" << pct(t_warp)     << "%)"
+             << "  stack="    << t_stack    << " (" << pct(t_stack)    << "%)"
+             << "  mhc="      << t_mhc      << " (" << pct(t_mhc)      << "%)"
+             << "  total="    << total      << "\n";
     }
 
     // ------------------------------------------------------------------
@@ -1392,20 +1790,20 @@ int main(int argc, char **argv)
 
     if (bayer)
     {
-        if (!writeFITS3(outputPath, finalR, finalG, finalB, dw, dh)) return 1;
+        if (!writeFITS3(outputPath, finalRout, finalG, finalBout, dw, dh)) return 1;
         cout << "Output: " << dw << "x" << dh << " 3-plane FITS (R/G/B)\n";
         if (!pngPath.empty())
         {
-            if (!writePNG(pngPath, finalR, finalG, finalB, dw, dh)) return 1;
+            if (!writePNG(pngPath, finalRout, finalG, finalBout, dw, dh)) return 1;
             cout << "PNG:    " << pngPath << "\n";
         }
     }
     else
     {
-        if (!writeFITS(outputPath, finalR, dw, dh)) return 1;
+        if (!writeFITS(outputPath, finalRout, dw, dh)) return 1;
         if (!pngPath.empty())
         {
-            if (!writePNG(pngPath, finalR, finalR, finalR, dw, dh)) return 1;
+            if (!writePNG(pngPath, finalRout, finalRout, finalRout, dw, dh)) return 1;
             cout << "PNG:    " << pngPath << "\n";
         }
     }
