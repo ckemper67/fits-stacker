@@ -364,19 +364,57 @@ static void extractSubplanes(const vector<Pix> &bayer, int bw, int bh,
     w = bw / 2; h = bh / 2;
     size_t npix = (size_t)w * h;
     R.resize(npix); G1.resize(npix); G2.resize(npix); B.resize(npix);
-    const int rr  = bl.r  >> 1, rc  = bl.r  & 1;
-    const int g1r = bl.g1 >> 1, g1c = bl.g1 & 1;
-    const int g2r = bl.g2 >> 1, g2c = bl.g2 & 1;
-    const int br  = bl.b  >> 1, bc  = bl.b  & 1;
+
+    // Map each 2x2 block position (row*2+col) to the correct output plane.
+    // subplane[0]=top-even, [1]=top-odd, [2]=bot-even, [3]=bot-odd.
+    Pix *sp[4];
+    sp[bl.r]  = R.data();
+    sp[bl.g1] = G1.data();
+    sp[bl.g2] = G2.data();
+    sp[bl.b]  = B.data();
+    Pix *te = sp[0], *to = sp[1], *be = sp[2], *bo = sp[3];
+
     for (int row = 0; row < h; ++row)
-        for (int col = 0; col < w; ++col)
+    {
+        const Pix *tsrc = bayer.data() + (size_t)(2*row)   * bw;
+        const Pix *bsrc = bayer.data() + (size_t)(2*row+1) * bw;
+        Pix *tep = te + (size_t)row * w;
+        Pix *top = to + (size_t)row * w;
+        Pix *bep = be + (size_t)row * w;
+        Pix *bop = bo + (size_t)row * w;
+
+        int col = 0;
+#ifdef __ARM_NEON
+        for (; col <= w - 4; col += 4)
         {
-            size_t i = (size_t)row * w + col;
-            R [i] = bayer[(size_t)(2*row + rr)  * bw + (2*col + rc )];
-            G1[i] = bayer[(size_t)(2*row + g1r) * bw + (2*col + g1c)];
-            G2[i] = bayer[(size_t)(2*row + g2r) * bw + (2*col + g2c)];
-            B [i] = bayer[(size_t)(2*row + br)  * bw + (2*col + bc )];
+            float32x4x2_t tv = vld2q_f32(tsrc + 2*col);
+            vst1q_f32(tep + col, tv.val[0]);
+            vst1q_f32(top + col, tv.val[1]);
+            float32x4x2_t bv = vld2q_f32(bsrc + 2*col);
+            vst1q_f32(bep + col, bv.val[0]);
+            vst1q_f32(bop + col, bv.val[1]);
         }
+#elif defined(__SSE2__)
+        for (; col <= w - 4; col += 4)
+        {
+            __m128 tlo = _mm_loadu_ps(tsrc + 2*col);
+            __m128 thi = _mm_loadu_ps(tsrc + 2*col + 4);
+            _mm_storeu_ps(tep + col, _mm_shuffle_ps(tlo, thi, _MM_SHUFFLE(2,0,2,0)));
+            _mm_storeu_ps(top + col, _mm_shuffle_ps(tlo, thi, _MM_SHUFFLE(3,1,3,1)));
+            __m128 blo = _mm_loadu_ps(bsrc + 2*col);
+            __m128 bhi = _mm_loadu_ps(bsrc + 2*col + 4);
+            _mm_storeu_ps(bep + col, _mm_shuffle_ps(blo, bhi, _MM_SHUFFLE(2,0,2,0)));
+            _mm_storeu_ps(bop + col, _mm_shuffle_ps(blo, bhi, _MM_SHUFFLE(3,1,3,1)));
+        }
+#endif
+        for (; col < w; ++col)
+        {
+            tep[col] = tsrc[2*col];
+            top[col] = tsrc[2*col + 1];
+            bep[col] = bsrc[2*col];
+            bop[col] = bsrc[2*col + 1];
+        }
+    }
 }
 
 // OpenCV bilinear demosaic + 2x2 INTER_AREA downsample to half resolution.
