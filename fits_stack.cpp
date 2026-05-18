@@ -1151,150 +1151,392 @@ static void debayerMHC_halfres(
     size_t npix = (size_t)w * h;
     outR.resize(npix); outG.resize(npix); outB.resize(npix);
 
-    // Clamped accessors into each subplane.
-    auto r  = [&](int i, int j) -> float { return R [std::clamp(i,0,h-1)*w + std::clamp(j,0,w-1)]; };
-    auto g1 = [&](int i, int j) -> float { return G1[std::clamp(i,0,h-1)*w + std::clamp(j,0,w-1)]; };
-    auto g2 = [&](int i, int j) -> float { return G2[std::clamp(i,0,h-1)*w + std::clamp(j,0,w-1)]; };
-    auto b  = [&](int i, int j) -> float { return B [std::clamp(i,0,h-1)*w + std::clamp(j,0,w-1)]; };
-
     parallelFor(h, nThreads, [&](int ylo, int yhi)
     {
         for (int oi = ylo; oi < yhi; ++oi)
-            for (int oj = 0; oj < w; ++oj)
+        {
+            // Clamp row indices once per output row -- handles border rows uniformly.
+            const int rim1 = std::max(oi - 1, 0);
+            const int rip1 = std::min(oi + 1, h - 1);
+            const Pix *R_m1  = R.data()  + (size_t)rim1 * w;
+            const Pix *R_0   = R.data()  + (size_t)oi   * w;
+            const Pix *R_p1  = R.data()  + (size_t)rip1 * w;
+            const Pix *G1_m1 = G1.data() + (size_t)rim1 * w;
+            const Pix *G1_0  = G1.data() + (size_t)oi   * w;
+            const Pix *G1_p1 = G1.data() + (size_t)rip1 * w;
+            const Pix *G2_m1 = G2.data() + (size_t)rim1 * w;
+            const Pix *G2_0  = G2.data() + (size_t)oi   * w;
+            const Pix *G2_p1 = G2.data() + (size_t)rip1 * w;
+            const Pix *B_m1  = B.data()  + (size_t)rim1 * w;
+            const Pix *B_0   = B.data()  + (size_t)oi   * w;
+            const Pix *B_p1  = B.data()  + (size_t)rip1 * w;
+
+            Pix *oR = outR.data() + (size_t)oi * w;
+            Pix *oG = outG.data() + (size_t)oi * w;
+            Pix *oB = outB.data() + (size_t)oi * w;
+
+            // Scalar kernel for one pixel; uses row ptrs + col clamp for borders.
+            auto scalarPx = [&](int oj)
             {
-                // --- R channel: average R value from all 4 full-res positions ---
-
-                // Position (2oi, 2oj): exact R sample.
-                float rR = r(oi, oj);
-
-                // Position (2oi, 2oj+1): G1 site -- K2 interpolates R along row.
+                auto cl = [&](const Pix *row, int j) -> float {
+                    return row[std::clamp(j, 0, w - 1)];
+                };
                 float rGrb = (
-                     0.5f * g1(oi-1, oj  ) +
-                    -1.0f * g2(oi-1, oj  ) +
-                    -1.0f * g2(oi-1, oj+1) +
-                    -1.0f * g1(oi,   oj-1) +
-                     4.0f * r (oi,   oj  ) +
-                     5.0f * g1(oi,   oj  ) +
-                     4.0f * r (oi,   oj+1) +
-                    -1.0f * g1(oi,   oj+1) +
-                    -1.0f * g2(oi,   oj  ) +
-                    -1.0f * g2(oi,   oj+1) +
-                     0.5f * g1(oi+1, oj  )
-                ) * (1.0f / 8.0f);
-
-                // Position (2oi+1, 2oj): G2 site -- K3 interpolates R along column.
+                     0.5f * cl(G1_m1, oj  ) - cl(G2_m1, oj  ) - cl(G2_m1, oj+1)
+                    - cl(G1_0, oj-1) + 4.0f*cl(R_0, oj) + 5.0f*cl(G1_0, oj)
+                    + 4.0f*cl(R_0, oj+1) - cl(G1_0, oj+1)
+                    - cl(G2_0, oj) - cl(G2_0, oj+1)
+                    + 0.5f * cl(G1_p1, oj)
+                ) * (1.0f/8.0f);
                 float rGbr = (
-                    -1.0f * g2(oi-1, oj  ) +
-                    -1.0f * g1(oi,   oj-1) +
-                     4.0f * r (oi,   oj  ) +
-                    -1.0f * g1(oi,   oj  ) +
-                     0.5f * g2(oi,   oj-1) +
-                     5.0f * g2(oi,   oj  ) +
-                     0.5f * g2(oi,   oj+1) +
-                    -1.0f * g1(oi+1, oj-1) +
-                     4.0f * r (oi+1, oj  ) +
-                    -1.0f * g1(oi+1, oj  ) +
-                    -1.0f * g2(oi+1, oj  )
-                ) * (1.0f / 8.0f);
-
-                // Position (2oi+1, 2oj+1): B site -- K4 interpolates R diagonally.
+                    - cl(G2_m1, oj)
+                    - cl(G1_0, oj-1) + 4.0f*cl(R_0, oj) - cl(G1_0, oj)
+                    + 0.5f*cl(G2_0, oj-1) + 5.0f*cl(G2_0, oj) + 0.5f*cl(G2_0, oj+1)
+                    - cl(G1_p1, oj-1) + 4.0f*cl(R_p1, oj) - cl(G1_p1, oj) - cl(G2_p1, oj)
+                ) * (1.0f/8.0f);
                 float rB = (
-                    -1.5f * b(oi-1, oj  ) +
-                     2.0f * r(oi,   oj  ) +
-                     2.0f * r(oi,   oj+1) +
-                    -1.5f * b(oi,   oj-1) +
-                     6.0f * b(oi,   oj  ) +
-                    -1.5f * b(oi,   oj+1) +
-                     2.0f * r(oi+1, oj  ) +
-                     2.0f * r(oi+1, oj+1) +
-                    -1.5f * b(oi+1, oj  )
-                ) * (1.0f / 8.0f);
-
-                // --- G channel: average G value from all 4 full-res positions ---
-
-                // Position (2oi, 2oj): R site -- K1 interpolates G.
+                    -1.5f*cl(B_m1, oj)
+                    + 2.0f*cl(R_0, oj) + 2.0f*cl(R_0, oj+1)
+                    - 1.5f*cl(B_0, oj-1) + 6.0f*cl(B_0, oj) - 1.5f*cl(B_0, oj+1)
+                    + 2.0f*cl(R_p1, oj) + 2.0f*cl(R_p1, oj+1)
+                    - 1.5f*cl(B_p1, oj)
+                ) * (1.0f/8.0f);
                 float gR = (
-                    -1.0f * r (oi-1, oj  ) +
-                     2.0f * g2(oi-1, oj  ) +
-                    -1.0f * r (oi,   oj-1) +
-                     2.0f * g1(oi,   oj-1) +
-                     4.0f * r (oi,   oj  ) +
-                     2.0f * g1(oi,   oj  ) +
-                    -1.0f * r (oi,   oj+1) +
-                     2.0f * g2(oi,   oj  ) +
-                    -1.0f * r (oi+1, oj  )
-                ) * (1.0f / 8.0f);
-
-                // Positions (2oi, 2oj+1) and (2oi+1, 2oj): exact G samples.
-                float gGrb = g1(oi, oj);
-                float gGbr = g2(oi, oj);
-
-                // Position (2oi+1, 2oj+1): B site -- K1 interpolates G.
+                    - cl(R_m1, oj) + 2.0f*cl(G2_m1, oj)
+                    - cl(R_0, oj-1) + 2.0f*cl(G1_0, oj-1) + 4.0f*cl(R_0, oj)
+                    + 2.0f*cl(G1_0, oj) - cl(R_0, oj+1) + 2.0f*cl(G2_0, oj)
+                    - cl(R_p1, oj)
+                ) * (1.0f/8.0f);
                 float gB = (
-                    -1.0f * b(oi-1, oj  ) +
-                     2.0f * g1(oi,   oj  ) +
-                    -1.0f * b(oi,   oj-1) +
-                     2.0f * g2(oi,   oj  ) +
-                     4.0f * b(oi,   oj  ) +
-                     2.0f * g2(oi,   oj+1) +
-                    -1.0f * b(oi,   oj+1) +
-                     2.0f * g1(oi+1, oj  ) +
-                    -1.0f * b(oi+1, oj  )
-                ) * (1.0f / 8.0f);
-
-                // --- B channel: average B value from all 4 full-res positions ---
-
-                // Position (2oi, 2oj): R site -- K4 interpolates B diagonally.
+                    - cl(B_m1, oj) + 2.0f*cl(G1_0, oj)
+                    - cl(B_0, oj-1) + 2.0f*cl(G2_0, oj) + 4.0f*cl(B_0, oj)
+                    + 2.0f*cl(G2_0, oj+1) - cl(B_0, oj+1)
+                    + 2.0f*cl(G1_p1, oj) - cl(B_p1, oj)
+                ) * (1.0f/8.0f);
                 float bR = (
-                    -1.5f * r(oi-1, oj  ) +
-                     2.0f * b(oi-1, oj-1) +
-                     2.0f * b(oi-1, oj  ) +
-                    -1.5f * r(oi,   oj-1) +
-                     6.0f * r(oi,   oj  ) +
-                    -1.5f * r(oi,   oj+1) +
-                     2.0f * b(oi,   oj-1) +
-                     2.0f * b(oi,   oj  ) +
-                    -1.5f * r(oi+1, oj  )
-                ) * (1.0f / 8.0f);
-
-                // Position (2oi, 2oj+1): G1 site -- K3 interpolates B along column.
+                    -1.5f*cl(R_m1, oj) + 2.0f*cl(B_m1, oj-1) + 2.0f*cl(B_m1, oj)
+                    - 1.5f*cl(R_0, oj-1) + 6.0f*cl(R_0, oj) - 1.5f*cl(R_0, oj+1)
+                    + 2.0f*cl(B_0, oj-1) + 2.0f*cl(B_0, oj)
+                    - 1.5f*cl(R_p1, oj)
+                ) * (1.0f/8.0f);
                 float bGrb = (
-                    -1.0f * g1(oi-1, oj  ) +
-                    -1.0f * g2(oi-1, oj  ) +
-                     4.0f * b (oi-1, oj  ) +
-                    -1.0f * g2(oi-1, oj+1) +
-                     0.5f * g1(oi,   oj-1) +
-                     5.0f * g1(oi,   oj  ) +
-                     0.5f * g1(oi,   oj+1) +
-                    -1.0f * g2(oi,   oj  ) +
-                     4.0f * b (oi,   oj  ) +
-                    -1.0f * g2(oi,   oj+1) +
-                    -1.0f * g1(oi+1, oj  )
-                ) * (1.0f / 8.0f);
-
-                // Position (2oi+1, 2oj): G2 site -- K2-variant interpolates B along row.
+                    - cl(G1_m1, oj) - cl(G2_m1, oj) + 4.0f*cl(B_m1, oj) - cl(G2_m1, oj+1)
+                    + 0.5f*cl(G1_0, oj-1) + 5.0f*cl(G1_0, oj) + 0.5f*cl(G1_0, oj+1)
+                    - cl(G2_0, oj) + 4.0f*cl(B_0, oj) - cl(G2_0, oj+1)
+                    - cl(G1_p1, oj)
+                ) * (1.0f/8.0f);
                 float bGbr = (
-                     0.5f * g2(oi-1, oj  ) +
-                    -1.0f * g1(oi,   oj-1) +
-                    -1.0f * g1(oi,   oj  ) +
-                    -1.0f * g2(oi,   oj-1) +
-                     4.0f * b (oi,   oj-1) +
-                     5.0f * g2(oi,   oj  ) +
-                     4.0f * b (oi,   oj  ) +
-                    -1.0f * g2(oi,   oj+1) +
-                    -1.0f * g1(oi+1, oj-1) +
-                    -1.0f * g1(oi+1, oj  ) +
-                     0.5f * g2(oi+1, oj  )
-                ) * (1.0f / 8.0f);
+                     0.5f*cl(G2_m1, oj)
+                    - cl(G1_0, oj-1) - cl(G1_0, oj) - cl(G2_0, oj-1)
+                    + 4.0f*cl(B_0, oj-1) + 5.0f*cl(G2_0, oj) + 4.0f*cl(B_0, oj)
+                    - cl(G2_0, oj+1) - cl(G1_p1, oj-1) - cl(G1_p1, oj)
+                    + 0.5f*cl(G2_p1, oj)
+                ) * (1.0f/8.0f);
+                oR[oj] = (R_0[oj] + rGrb + rGbr + rB)         * 0.25f;
+                oG[oj] = (gR + G1_0[oj] + G2_0[oj] + gB)     * 0.25f;
+                oB[oj] = (bR + bGrb + bGbr + B_0[oj])         * 0.25f;
+            };
 
-                // Position (2oi+1, 2oj+1): exact B sample.
-                float bB = b(oi, oj);
+            // SIMD interior: oj in [1, w-5], accesses col oj-1..oj+4, all in bounds.
+            // Scalar handles oj=0 and the tail (oj > w-5).
+            int oj = 0;
+            scalarPx(0);
+            ++oj;
 
-                size_t idx = (size_t)oi * w + oj;
-                outR[idx] = (rR + rGrb + rGbr + rB)   * 0.25f;
-                outG[idx] = (gR + gGrb + gGbr + gB)   * 0.25f;
-                outB[idx] = (bR + bGrb + bGbr + bB)   * 0.25f;
+#ifdef __ARM_NEON
+            for (; oj <= w - 5; oj += 4)
+            {
+                // 24 loads covering all (subplane, row_offset, col_offset) combinations.
+                float32x4_t rm1_c  = vld1q_f32(R_m1  + oj);
+                float32x4_t r0_l   = vld1q_f32(R_0   + oj - 1);
+                float32x4_t r0_c   = vld1q_f32(R_0   + oj);
+                float32x4_t r0_r   = vld1q_f32(R_0   + oj + 1);
+                float32x4_t rp1_c  = vld1q_f32(R_p1  + oj);
+                float32x4_t rp1_r  = vld1q_f32(R_p1  + oj + 1);
+                float32x4_t g1m1_c = vld1q_f32(G1_m1 + oj);
+                float32x4_t g1_l   = vld1q_f32(G1_0  + oj - 1);
+                float32x4_t g1_c   = vld1q_f32(G1_0  + oj);
+                float32x4_t g1_r   = vld1q_f32(G1_0  + oj + 1);
+                float32x4_t g1p1_l = vld1q_f32(G1_p1 + oj - 1);
+                float32x4_t g1p1_c = vld1q_f32(G1_p1 + oj);
+                float32x4_t g2m1_c = vld1q_f32(G2_m1 + oj);
+                float32x4_t g2m1_r = vld1q_f32(G2_m1 + oj + 1);
+                float32x4_t g2_l   = vld1q_f32(G2_0  + oj - 1);
+                float32x4_t g2_c   = vld1q_f32(G2_0  + oj);
+                float32x4_t g2_r   = vld1q_f32(G2_0  + oj + 1);
+                float32x4_t g2p1_c = vld1q_f32(G2_p1 + oj);
+                float32x4_t bm1_l  = vld1q_f32(B_m1  + oj - 1);
+                float32x4_t bm1_c  = vld1q_f32(B_m1  + oj);
+                float32x4_t b_l    = vld1q_f32(B_0   + oj - 1);
+                float32x4_t b_c    = vld1q_f32(B_0   + oj);
+                float32x4_t b_r    = vld1q_f32(B_0   + oj + 1);
+                float32x4_t bp1_c  = vld1q_f32(B_p1  + oj);
+
+                // R channel
+                float32x4_t vRGrb = vmulq_n_f32(g1m1_c, 0.5f);
+                vRGrb = vsubq_f32(vRGrb, g2m1_c);
+                vRGrb = vsubq_f32(vRGrb, g2m1_r);
+                vRGrb = vsubq_f32(vRGrb, g1_l);
+                vRGrb = vmlaq_n_f32(vRGrb, r0_c, 4.0f);
+                vRGrb = vmlaq_n_f32(vRGrb, g1_c, 5.0f);
+                vRGrb = vmlaq_n_f32(vRGrb, r0_r, 4.0f);
+                vRGrb = vsubq_f32(vRGrb, g1_r);
+                vRGrb = vsubq_f32(vRGrb, g2_c);
+                vRGrb = vsubq_f32(vRGrb, g2_r);
+                vRGrb = vmlaq_n_f32(vRGrb, g1p1_c, 0.5f);
+                vRGrb = vmulq_n_f32(vRGrb, 1.0f/8.0f);
+
+                float32x4_t vRGbr = vnegq_f32(g2m1_c);
+                vRGbr = vsubq_f32(vRGbr, g1_l);
+                vRGbr = vmlaq_n_f32(vRGbr, r0_c, 4.0f);
+                vRGbr = vsubq_f32(vRGbr, g1_c);
+                vRGbr = vmlaq_n_f32(vRGbr, g2_l, 0.5f);
+                vRGbr = vmlaq_n_f32(vRGbr, g2_c, 5.0f);
+                vRGbr = vmlaq_n_f32(vRGbr, g2_r, 0.5f);
+                vRGbr = vsubq_f32(vRGbr, g1p1_l);
+                vRGbr = vmlaq_n_f32(vRGbr, rp1_c, 4.0f);
+                vRGbr = vsubq_f32(vRGbr, g1p1_c);
+                vRGbr = vsubq_f32(vRGbr, g2p1_c);
+                vRGbr = vmulq_n_f32(vRGbr, 1.0f/8.0f);
+
+                float32x4_t vRB = vmulq_n_f32(bm1_c, -1.5f);
+                vRB = vmlaq_n_f32(vRB, r0_c,  2.0f);
+                vRB = vmlaq_n_f32(vRB, r0_r,  2.0f);
+                vRB = vmlaq_n_f32(vRB, b_l,  -1.5f);
+                vRB = vmlaq_n_f32(vRB, b_c,   6.0f);
+                vRB = vmlaq_n_f32(vRB, b_r,  -1.5f);
+                vRB = vmlaq_n_f32(vRB, rp1_c, 2.0f);
+                vRB = vmlaq_n_f32(vRB, rp1_r, 2.0f);
+                vRB = vmlaq_n_f32(vRB, bp1_c,-1.5f);
+                vRB = vmulq_n_f32(vRB, 1.0f/8.0f);
+
+                float32x4_t vOutR = vmulq_n_f32(
+                    vaddq_f32(vaddq_f32(r0_c, vRGrb), vaddq_f32(vRGbr, vRB)), 0.25f);
+
+                // G channel
+                float32x4_t vGR = vnegq_f32(rm1_c);
+                vGR = vmlaq_n_f32(vGR, g2m1_c, 2.0f);
+                vGR = vsubq_f32(vGR, r0_l);
+                vGR = vmlaq_n_f32(vGR, g1_l, 2.0f);
+                vGR = vmlaq_n_f32(vGR, r0_c, 4.0f);
+                vGR = vmlaq_n_f32(vGR, g1_c, 2.0f);
+                vGR = vsubq_f32(vGR, r0_r);
+                vGR = vmlaq_n_f32(vGR, g2_c, 2.0f);
+                vGR = vsubq_f32(vGR, rp1_c);
+                vGR = vmulq_n_f32(vGR, 1.0f/8.0f);
+
+                float32x4_t vGB = vnegq_f32(bm1_c);
+                vGB = vmlaq_n_f32(vGB, g1_c, 2.0f);
+                vGB = vsubq_f32(vGB, b_l);
+                vGB = vmlaq_n_f32(vGB, g2_c, 2.0f);
+                vGB = vmlaq_n_f32(vGB, b_c,  4.0f);
+                vGB = vmlaq_n_f32(vGB, g2_r, 2.0f);
+                vGB = vsubq_f32(vGB, b_r);
+                vGB = vmlaq_n_f32(vGB, g1p1_c, 2.0f);
+                vGB = vsubq_f32(vGB, bp1_c);
+                vGB = vmulq_n_f32(vGB, 1.0f/8.0f);
+
+                float32x4_t vOutG = vmulq_n_f32(
+                    vaddq_f32(vaddq_f32(vGR, g1_c), vaddq_f32(g2_c, vGB)), 0.25f);
+
+                // B channel
+                float32x4_t vBR = vmulq_n_f32(rm1_c, -1.5f);
+                vBR = vmlaq_n_f32(vBR, bm1_l, 2.0f);
+                vBR = vmlaq_n_f32(vBR, bm1_c, 2.0f);
+                vBR = vmlaq_n_f32(vBR, r0_l, -1.5f);
+                vBR = vmlaq_n_f32(vBR, r0_c,  6.0f);
+                vBR = vmlaq_n_f32(vBR, r0_r, -1.5f);
+                vBR = vmlaq_n_f32(vBR, b_l,   2.0f);
+                vBR = vmlaq_n_f32(vBR, b_c,   2.0f);
+                vBR = vmlaq_n_f32(vBR, rp1_c,-1.5f);
+                vBR = vmulq_n_f32(vBR, 1.0f/8.0f);
+
+                float32x4_t vBGrb = vnegq_f32(g1m1_c);
+                vBGrb = vsubq_f32(vBGrb, g2m1_c);
+                vBGrb = vmlaq_n_f32(vBGrb, bm1_c, 4.0f);
+                vBGrb = vsubq_f32(vBGrb, g2m1_r);
+                vBGrb = vmlaq_n_f32(vBGrb, g1_l, 0.5f);
+                vBGrb = vmlaq_n_f32(vBGrb, g1_c, 5.0f);
+                vBGrb = vmlaq_n_f32(vBGrb, g1_r, 0.5f);
+                vBGrb = vsubq_f32(vBGrb, g2_c);
+                vBGrb = vmlaq_n_f32(vBGrb, b_c,  4.0f);
+                vBGrb = vsubq_f32(vBGrb, g2_r);
+                vBGrb = vsubq_f32(vBGrb, g1p1_c);
+                vBGrb = vmulq_n_f32(vBGrb, 1.0f/8.0f);
+
+                float32x4_t vBGbr = vmulq_n_f32(g2m1_c, 0.5f);
+                vBGbr = vsubq_f32(vBGbr, g1_l);
+                vBGbr = vsubq_f32(vBGbr, g1_c);
+                vBGbr = vsubq_f32(vBGbr, g2_l);
+                vBGbr = vmlaq_n_f32(vBGbr, b_l,   4.0f);
+                vBGbr = vmlaq_n_f32(vBGbr, g2_c,  5.0f);
+                vBGbr = vmlaq_n_f32(vBGbr, b_c,   4.0f);
+                vBGbr = vsubq_f32(vBGbr, g2_r);
+                vBGbr = vsubq_f32(vBGbr, g1p1_l);
+                vBGbr = vsubq_f32(vBGbr, g1p1_c);
+                vBGbr = vmlaq_n_f32(vBGbr, g2p1_c, 0.5f);
+                vBGbr = vmulq_n_f32(vBGbr, 1.0f/8.0f);
+
+                float32x4_t vOutB = vmulq_n_f32(
+                    vaddq_f32(vaddq_f32(vBR, vBGrb), vaddq_f32(vBGbr, b_c)), 0.25f);
+
+                vst1q_f32(oR + oj, vOutR);
+                vst1q_f32(oG + oj, vOutG);
+                vst1q_f32(oB + oj, vOutB);
             }
+#elif defined(__SSE2__)
+            for (; oj <= w - 5; oj += 4)
+            {
+                auto ld  = [](const Pix *p, int o) { return _mm_loadu_ps(p + o); };
+                auto mla = [](__m128 a, __m128 b, float s) {
+                    return _mm_add_ps(a, _mm_mul_ps(b, _mm_set1_ps(s)));
+                };
+
+                __m128 rm1_c  = ld(R_m1,  oj);
+                __m128 r0_l   = ld(R_0,   oj - 1);
+                __m128 r0_c   = ld(R_0,   oj);
+                __m128 r0_r   = ld(R_0,   oj + 1);
+                __m128 rp1_c  = ld(R_p1,  oj);
+                __m128 rp1_r  = ld(R_p1,  oj + 1);
+                __m128 g1m1_c = ld(G1_m1, oj);
+                __m128 g1_l   = ld(G1_0,  oj - 1);
+                __m128 g1_c   = ld(G1_0,  oj);
+                __m128 g1_r   = ld(G1_0,  oj + 1);
+                __m128 g1p1_l = ld(G1_p1, oj - 1);
+                __m128 g1p1_c = ld(G1_p1, oj);
+                __m128 g2m1_c = ld(G2_m1, oj);
+                __m128 g2m1_r = ld(G2_m1, oj + 1);
+                __m128 g2_l   = ld(G2_0,  oj - 1);
+                __m128 g2_c   = ld(G2_0,  oj);
+                __m128 g2_r   = ld(G2_0,  oj + 1);
+                __m128 g2p1_c = ld(G2_p1, oj);
+                __m128 bm1_l  = ld(B_m1,  oj - 1);
+                __m128 bm1_c  = ld(B_m1,  oj);
+                __m128 b_l    = ld(B_0,   oj - 1);
+                __m128 b_c    = ld(B_0,   oj);
+                __m128 b_r    = ld(B_0,   oj + 1);
+                __m128 bp1_c  = ld(B_p1,  oj);
+
+                // R channel
+                __m128 vRGrb = _mm_mul_ps(g1m1_c, _mm_set1_ps(0.5f));
+                vRGrb = _mm_sub_ps(vRGrb, g2m1_c);
+                vRGrb = _mm_sub_ps(vRGrb, g2m1_r);
+                vRGrb = _mm_sub_ps(vRGrb, g1_l);
+                vRGrb = mla(vRGrb, r0_c, 4.0f);
+                vRGrb = mla(vRGrb, g1_c, 5.0f);
+                vRGrb = mla(vRGrb, r0_r, 4.0f);
+                vRGrb = _mm_sub_ps(vRGrb, g1_r);
+                vRGrb = _mm_sub_ps(vRGrb, g2_c);
+                vRGrb = _mm_sub_ps(vRGrb, g2_r);
+                vRGrb = mla(vRGrb, g1p1_c, 0.5f);
+                vRGrb = _mm_mul_ps(vRGrb, _mm_set1_ps(1.0f/8.0f));
+
+                __m128 vRGbr = _mm_sub_ps(_mm_setzero_ps(), g2m1_c);
+                vRGbr = _mm_sub_ps(vRGbr, g1_l);
+                vRGbr = mla(vRGbr, r0_c, 4.0f);
+                vRGbr = _mm_sub_ps(vRGbr, g1_c);
+                vRGbr = mla(vRGbr, g2_l, 0.5f);
+                vRGbr = mla(vRGbr, g2_c, 5.0f);
+                vRGbr = mla(vRGbr, g2_r, 0.5f);
+                vRGbr = _mm_sub_ps(vRGbr, g1p1_l);
+                vRGbr = mla(vRGbr, rp1_c, 4.0f);
+                vRGbr = _mm_sub_ps(vRGbr, g1p1_c);
+                vRGbr = _mm_sub_ps(vRGbr, g2p1_c);
+                vRGbr = _mm_mul_ps(vRGbr, _mm_set1_ps(1.0f/8.0f));
+
+                __m128 vRB = _mm_mul_ps(bm1_c, _mm_set1_ps(-1.5f));
+                vRB = mla(vRB, r0_c,   2.0f);
+                vRB = mla(vRB, r0_r,   2.0f);
+                vRB = mla(vRB, b_l,   -1.5f);
+                vRB = mla(vRB, b_c,    6.0f);
+                vRB = mla(vRB, b_r,   -1.5f);
+                vRB = mla(vRB, rp1_c,  2.0f);
+                vRB = mla(vRB, rp1_r,  2.0f);
+                vRB = mla(vRB, bp1_c, -1.5f);
+                vRB = _mm_mul_ps(vRB, _mm_set1_ps(1.0f/8.0f));
+
+                __m128 vOutR = _mm_mul_ps(
+                    _mm_add_ps(_mm_add_ps(r0_c, vRGrb), _mm_add_ps(vRGbr, vRB)),
+                    _mm_set1_ps(0.25f));
+
+                // G channel
+                __m128 vGR = _mm_sub_ps(_mm_setzero_ps(), rm1_c);
+                vGR = mla(vGR, g2m1_c, 2.0f);
+                vGR = _mm_sub_ps(vGR, r0_l);
+                vGR = mla(vGR, g1_l, 2.0f);
+                vGR = mla(vGR, r0_c, 4.0f);
+                vGR = mla(vGR, g1_c, 2.0f);
+                vGR = _mm_sub_ps(vGR, r0_r);
+                vGR = mla(vGR, g2_c, 2.0f);
+                vGR = _mm_sub_ps(vGR, rp1_c);
+                vGR = _mm_mul_ps(vGR, _mm_set1_ps(1.0f/8.0f));
+
+                __m128 vGB = _mm_sub_ps(_mm_setzero_ps(), bm1_c);
+                vGB = mla(vGB, g1_c, 2.0f);
+                vGB = _mm_sub_ps(vGB, b_l);
+                vGB = mla(vGB, g2_c, 2.0f);
+                vGB = mla(vGB, b_c,  4.0f);
+                vGB = mla(vGB, g2_r, 2.0f);
+                vGB = _mm_sub_ps(vGB, b_r);
+                vGB = mla(vGB, g1p1_c, 2.0f);
+                vGB = _mm_sub_ps(vGB, bp1_c);
+                vGB = _mm_mul_ps(vGB, _mm_set1_ps(1.0f/8.0f));
+
+                __m128 vOutG = _mm_mul_ps(
+                    _mm_add_ps(_mm_add_ps(vGR, g1_c), _mm_add_ps(g2_c, vGB)),
+                    _mm_set1_ps(0.25f));
+
+                // B channel
+                __m128 vBR = _mm_mul_ps(rm1_c, _mm_set1_ps(-1.5f));
+                vBR = mla(vBR, bm1_l,  2.0f);
+                vBR = mla(vBR, bm1_c,  2.0f);
+                vBR = mla(vBR, r0_l,  -1.5f);
+                vBR = mla(vBR, r0_c,   6.0f);
+                vBR = mla(vBR, r0_r,  -1.5f);
+                vBR = mla(vBR, b_l,    2.0f);
+                vBR = mla(vBR, b_c,    2.0f);
+                vBR = mla(vBR, rp1_c, -1.5f);
+                vBR = _mm_mul_ps(vBR, _mm_set1_ps(1.0f/8.0f));
+
+                __m128 vBGrb = _mm_sub_ps(_mm_setzero_ps(), g1m1_c);
+                vBGrb = _mm_sub_ps(vBGrb, g2m1_c);
+                vBGrb = mla(vBGrb, bm1_c, 4.0f);
+                vBGrb = _mm_sub_ps(vBGrb, g2m1_r);
+                vBGrb = mla(vBGrb, g1_l, 0.5f);
+                vBGrb = mla(vBGrb, g1_c, 5.0f);
+                vBGrb = mla(vBGrb, g1_r, 0.5f);
+                vBGrb = _mm_sub_ps(vBGrb, g2_c);
+                vBGrb = mla(vBGrb, b_c,  4.0f);
+                vBGrb = _mm_sub_ps(vBGrb, g2_r);
+                vBGrb = _mm_sub_ps(vBGrb, g1p1_c);
+                vBGrb = _mm_mul_ps(vBGrb, _mm_set1_ps(1.0f/8.0f));
+
+                __m128 vBGbr = _mm_mul_ps(g2m1_c, _mm_set1_ps(0.5f));
+                vBGbr = _mm_sub_ps(vBGbr, g1_l);
+                vBGbr = _mm_sub_ps(vBGbr, g1_c);
+                vBGbr = _mm_sub_ps(vBGbr, g2_l);
+                vBGbr = mla(vBGbr, b_l,    4.0f);
+                vBGbr = mla(vBGbr, g2_c,   5.0f);
+                vBGbr = mla(vBGbr, b_c,    4.0f);
+                vBGbr = _mm_sub_ps(vBGbr, g2_r);
+                vBGbr = _mm_sub_ps(vBGbr, g1p1_l);
+                vBGbr = _mm_sub_ps(vBGbr, g1p1_c);
+                vBGbr = mla(vBGbr, g2p1_c, 0.5f);
+                vBGbr = _mm_mul_ps(vBGbr, _mm_set1_ps(1.0f/8.0f));
+
+                __m128 vOutB = _mm_mul_ps(
+                    _mm_add_ps(_mm_add_ps(vBR, vBGrb), _mm_add_ps(vBGbr, b_c)),
+                    _mm_set1_ps(0.25f));
+
+                _mm_storeu_ps(oR + oj, vOutR);
+                _mm_storeu_ps(oG + oj, vOutG);
+                _mm_storeu_ps(oB + oj, vOutB);
+            }
+#endif
+            // Scalar tail (right border and any columns not covered by SIMD).
+            for (; oj < w; ++oj)
+                scalarPx(oj);
+        }
     });
 }
 
